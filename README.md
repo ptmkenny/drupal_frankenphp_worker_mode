@@ -36,3 +36,7 @@ Also, doing reviews of any of the drupal.org issues listed in patches.json would
 ## Update Policy
 
 I will accept MRs for fixes or any additional useful tools that anyone finds or creates. I will also try to keep this in sync with my own efforts; I've structured it in a way that I can easily get an agent to copy over updates.
+
+## License
+
+GPL-2.0-or-later, the same as Drupal core. See [LICENSE.txt](LICENSE.txt).
