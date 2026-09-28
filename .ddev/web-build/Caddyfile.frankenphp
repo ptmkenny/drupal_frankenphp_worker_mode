@@ -1,0 +1,53 @@
+# Project-owned wrapper around the experimental Drupal MR routing.
+# Derived from ddev/ddev-frankenphp 8587c8311c8bbd256330e2f059e43d10258a6e48.
+{
+	skip_install_trust
+	auto_https off
+	servers {
+		trusted_proxies static private_ranges
+		trusted_proxies_strict
+	}
+	frankenphp {
+		# Keep DDEV HTTP limits separate from the unlimited CLI setting.
+		php_ini memory_limit 1024M
+		# Optional local worker configuration; empty by default.
+		{$FRANKENPHP_CONFIG}
+	}
+}
+
+(common_config) {
+	root * /var/www/html/web
+	encode zstd br gzip
+	route {
+		vars {
+			drupal_https off
+			drupal_port 80
+			drupal_scheme http
+		}
+		@forwardedHttps {
+			remote_ip private_ranges
+			header X-Forwarded-Proto https
+		}
+		vars @forwardedHttps {
+			drupal_https on
+			drupal_port 443
+			drupal_scheme https
+		}
+		@directHttps protocol https
+		vars @directHttps {
+			drupal_https on
+			drupal_port 443
+			drupal_scheme https
+		}
+		import /var/www/html/.ddev/frankenphp/drupal.caddyfile
+	}
+}
+
+:80 {
+	import common_config
+}
+
+:443 {
+	tls /etc/ssl/certs/master.crt /etc/ssl/certs/master.key
+	import common_config
+}

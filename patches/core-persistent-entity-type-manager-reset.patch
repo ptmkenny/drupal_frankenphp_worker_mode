@@ -1,0 +1,249 @@
+diff --git a/core/core.services.yml b/core/core.services.yml
+index 28afb5a64da..2b5d4072160 100644
+--- a/core/core.services.yml
++++ b/core/core.services.yml
+@@ -775,7 +775,7 @@ services:
+     deprecated: 'The "%alias_id%" service is deprecated in drupal:11.3.0 and is removed from drupal:13.0.0. Use #Autowire to pick a specific cache bin, such as cache.memory. See https://www.drupal.org/node/3546856'
+   entity_type.manager:
+     class: Drupal\Core\Entity\EntityTypeManager
+-    arguments: ['@container.namespaces', '@module_handler', '@cache.discovery', '@string_translation', '@class_resolver', '@entity.last_installed_schema.repository', '@service_container']
++    arguments: ['@container.namespaces', '@module_handler', '@cache.discovery', !service_closure '@string_translation', '@class_resolver', !service_closure '@entity.last_installed_schema.repository', '@service_container']
+     tags:
+       - { name: plugin_manager_cache_clear }
+   Drupal\Core\Entity\EntityTypeManagerInterface: '@entity_type.manager'
+diff --git a/core/lib/Drupal/Core/Entity/EntityTypeManager.php b/core/lib/Drupal/Core/Entity/EntityTypeManager.php
+index b858d407271..9402aeba0d1 100644
+--- a/core/lib/Drupal/Core/Entity/EntityTypeManager.php
++++ b/core/lib/Drupal/Core/Entity/EntityTypeManager.php
+@@ -14,6 +14,7 @@
+ use Drupal\Core\Plugin\Discovery\AttributeDiscoveryWithAnnotations;
+ use Drupal\Core\StringTranslation\TranslationInterface;
+ use Symfony\Component\DependencyInjection\ContainerInterface;
++use Symfony\Contracts\Service\ResetInterface;
+ 
+ /**
+  * Manages entity type plugin definitions.
+@@ -34,7 +35,7 @@
+  * @see hook_entity_type_alter()
+  * @see hook_entity_type_build()
+  */
+-class EntityTypeManager extends DefaultPluginManager implements EntityTypeManagerInterface {
++class EntityTypeManager extends DefaultPluginManager implements EntityTypeManagerInterface, ResetInterface {
+ 
+   /**
+    * Contains instantiated handlers keyed by handler type and entity type.
+@@ -46,10 +47,18 @@ class EntityTypeManager extends DefaultPluginManager implements EntityTypeManage
+   /**
+    * The string translation service.
+    *
+-   * @var \Drupal\Core\StringTranslation\TranslationInterface
++   * NULL when the service is fetched through a service closure; use
++   * ::getStringTranslation().
++   *
++   * @var \Drupal\Core\StringTranslation\TranslationInterface|null
+    */
+   protected $stringTranslation;
+ 
++  /**
++   * Fetches the string translation service, if it is not held directly.
++   */
++  private ?\Closure $stringTranslationClosure = NULL;
++
+   /**
+    * The class resolver.
+    *
+@@ -60,10 +69,23 @@ class EntityTypeManager extends DefaultPluginManager implements EntityTypeManage
+   /**
+    * The entity last installed schema repository.
+    *
+-   * @var \Drupal\Core\Entity\EntityLastInstalledSchemaRepositoryInterface
++   * NULL when the service is fetched through a service closure; use
++   * ::getEntityLastInstalledSchemaRepository().
++   *
++   * @var \Drupal\Core\Entity\EntityLastInstalledSchemaRepositoryInterface|null
+    */
+   protected $entityLastInstalledSchemaRepository;
+ 
++  /**
++   * Fetches the last installed schema repository, if it is not held directly.
++   */
++  private ?\Closure $entityLastInstalledSchemaRepositoryClosure = NULL;
++
++  /**
++   * The checksum of the definition cache tags at the last reset.
++   */
++  private ?string $definitionsChecksum = NULL;
++
+   /**
+    * Constructs a new Entity plugin manager.
+    *
+@@ -74,25 +96,75 @@ class EntityTypeManager extends DefaultPluginManager implements EntityTypeManage
+    *   The module handler.
+    * @param \Drupal\Core\Cache\CacheBackendInterface $cache
+    *   The cache backend to use.
+-   * @param \Drupal\Core\StringTranslation\TranslationInterface $string_translation
+-   *   The string translation.
++   * @param \Drupal\Core\StringTranslation\TranslationInterface|\Closure $string_translation
++   *   The string translation, or a service closure that returns it.
+    * @param \Drupal\Core\DependencyInjection\ClassResolverInterface $class_resolver
+    *   The class resolver.
+-   * @param \Drupal\Core\Entity\EntityLastInstalledSchemaRepositoryInterface $entity_last_installed_schema_repository
+-   *   The entity last installed schema repository.
++   * @param \Drupal\Core\Entity\EntityLastInstalledSchemaRepositoryInterface|\Closure $entity_last_installed_schema_repository
++   *   The entity last installed schema repository, or a service closure that
++   *   returns it.
+    * @param \Symfony\Component\DependencyInjection\ContainerInterface $container
+    *   The service container.
+    */
+-  public function __construct(\Traversable $namespaces, ModuleHandlerInterface $module_handler, CacheBackendInterface $cache, TranslationInterface $string_translation, ClassResolverInterface $class_resolver, EntityLastInstalledSchemaRepositoryInterface $entity_last_installed_schema_repository, protected ContainerInterface $container) {
++  public function __construct(\Traversable $namespaces, ModuleHandlerInterface $module_handler, CacheBackendInterface $cache, TranslationInterface|\Closure $string_translation, ClassResolverInterface $class_resolver, EntityLastInstalledSchemaRepositoryInterface|\Closure $entity_last_installed_schema_repository, protected ContainerInterface $container) {
+     parent::__construct('Entity', $namespaces, $module_handler, EntityInterface::class);
+ 
+     $this->setCacheBackend($cache, 'entity_type', ['entity_types']);
+     $this->alterInfo('entity_type');
+ 
+     $this->discovery = new AttributeDiscoveryWithAnnotations($this->subdir, $this->namespaces, EntityType::class, 'Drupal\Core\Entity\Annotation\EntityType');
+-    $this->stringTranslation = $string_translation;
++    // Service closures let a persistent worker reuse this manager across
++    // requests without holding request-scoped services.
++    if ($string_translation instanceof \Closure) {
++      $this->stringTranslationClosure = $string_translation;
++    }
++    else {
++      $this->stringTranslation = $string_translation;
++    }
+     $this->classResolver = $class_resolver;
+-    $this->entityLastInstalledSchemaRepository = $entity_last_installed_schema_repository;
++    if ($entity_last_installed_schema_repository instanceof \Closure) {
++      $this->entityLastInstalledSchemaRepositoryClosure = $entity_last_installed_schema_repository;
++    }
++    else {
++      $this->entityLastInstalledSchemaRepository = $entity_last_installed_schema_repository;
++    }
++  }
++
++  /**
++   * Prepares the manager for reuse by another request.
++   *
++   * Persistent workers call this between requests. Handlers are dropped,
++   * because they hold request-scoped services and loaded entities. Definitions
++   * are kept unless their cache tags were invalidated, including by another
++   * process.
++   */
++  public function reset(): void {
++    $this->handlers = [];
++    $checksum = (string) $this->container->get('cache_tags.invalidator.checksum')->getCurrentChecksum($this->cacheTags);
++    if ($checksum !== $this->definitionsChecksum) {
++      $this->definitions = NULL;
++      $this->definitionsChecksum = $checksum;
++    }
++  }
++
++  /**
++   * Gets the string translation service.
++   *
++   * @return \Drupal\Core\StringTranslation\TranslationInterface
++   *   The string translation service.
++   */
++  protected function getStringTranslation(): TranslationInterface {
++    return $this->stringTranslationClosure ? ($this->stringTranslationClosure)() : $this->stringTranslation;
++  }
++
++  /**
++   * Gets the entity last installed schema repository.
++   *
++   * @return \Drupal\Core\Entity\EntityLastInstalledSchemaRepositoryInterface
++   *   The entity last installed schema repository.
++   */
++  protected function getEntityLastInstalledSchemaRepository(): EntityLastInstalledSchemaRepositoryInterface {
++    return $this->entityLastInstalledSchemaRepositoryClosure ? ($this->entityLastInstalledSchemaRepositoryClosure)() : $this->entityLastInstalledSchemaRepository;
+   }
+ 
+   /**
+@@ -183,7 +255,7 @@ public function getDefinition($entity_type_id, $exception_on_invalid = TRUE) {
+    * @internal
+    */
+   public function getActiveDefinition($entity_type_id) {
+-    $definition = $this->entityLastInstalledSchemaRepository->getLastInstalledDefinition($entity_type_id);
++    $definition = $this->getEntityLastInstalledSchemaRepository()->getLastInstalledDefinition($entity_type_id);
+     return $definition ?: $this->getDefinition($entity_type_id);
+   }
+ 
+@@ -249,7 +321,7 @@ public function getFormObject($entity_type_id, $operation) {
+     }
+ 
+     return $form_object
+-      ->setStringTranslation($this->stringTranslation)
++      ->setStringTranslation($this->getStringTranslation())
+       ->setModuleHandler($this->moduleHandler)
+       ->setEntityTypeManager($this)
+       ->setOperation($operation);
+@@ -318,7 +390,7 @@ public function createHandlerInstance($class, ?EntityTypeInterface $definition =
+       $handler->setModuleHandler($this->moduleHandler);
+     }
+     if (method_exists($handler, 'setStringTranslation')) {
+-      $handler->setStringTranslation($this->stringTranslation);
++      $handler->setStringTranslation($this->getStringTranslation());
+     }
+ 
+     return $handler;
+diff --git a/core/tests/Drupal/Tests/Core/Entity/EntityTypeManagerTest.php b/core/tests/Drupal/Tests/Core/Entity/EntityTypeManagerTest.php
+index b3c502419eb..3beb8799e0a 100644
+--- a/core/tests/Drupal/Tests/Core/Entity/EntityTypeManagerTest.php
++++ b/core/tests/Drupal/Tests/Core/Entity/EntityTypeManagerTest.php
+@@ -8,6 +8,7 @@
+ use Drupal\Component\Plugin\Exception\InvalidPluginDefinitionException;
+ use Drupal\Component\Plugin\Exception\PluginNotFoundException;
+ use Drupal\Core\Cache\CacheBackendInterface;
++use Drupal\Core\Cache\CacheTagsChecksumInterface;
+ use Drupal\Core\DependencyInjection\ContainerInjectionInterface;
+ use Drupal\Core\Entity\EntityForm;
+ use Drupal\Core\Entity\EntityHandlerBase;
+@@ -340,6 +341,47 @@ public static function provideMissingHandlerData() : array {
+     ];
+   }
+ 
++  /**
++   * Tests reuse across requests with service closures.
++   */
++  public function testReset(): void {
++    $checksum = $this->prophesize(CacheTagsChecksumInterface::class);
++    $checksum->getCurrentChecksum(['entity_types'])->willReturn('1', '1', '2');
++    $container = new Container();
++    $container->set('cache_tags.invalidator.checksum', $checksum->reveal());
++    $translation = $this->translationManager->reveal();
++    $apple = $this->prophesize(EntityTypeInterface::class);
++    $apple->getHandlerClass('storage')->willReturn(StubEntityHandlerBase::class);
++    $installed = $this->prophesize(EntityTypeInterface::class)->reveal();
++    $this->entityLastInstalledSchemaRepository->getLastInstalledDefinition('apple')->willReturn($installed);
++    $repository = $this->entityLastInstalledSchemaRepository->reveal();
++
++    $manager = new TestEntityTypeManager(new \ArrayObject(), $this->moduleHandler->reveal(), $this->cacheBackend->reveal(), fn() => $translation, $this->getClassResolverStub(), fn() => $repository, $container);
++    $manager->setDiscovery($this->discovery->reveal());
++    $this->setUpEntityTypeDefinitions(['apple' => $apple]);
++
++    // Handlers receive the services from the closures.
++    $storage = $manager->getHandler('apple', 'storage');
++    $this->assertSame($translation, $storage->stringTranslation);
++    $this->assertSame($installed, $manager->getActiveDefinition('apple'));
++
++    // The first reset drops definitions that were loaded before the checksum
++    // was known. Handlers are always dropped.
++    $manager->reset();
++    $this->assertNotSame($storage, $storage = $manager->getHandler('apple', 'storage'));
++    $this->discovery->getDefinitions()->shouldHaveBeenCalledTimes(2);
++
++    // Definitions are kept while the checksum is unchanged.
++    $manager->reset();
++    $this->assertNotSame($storage, $manager->getHandler('apple', 'storage'));
++    $this->discovery->getDefinitions()->shouldHaveBeenCalledTimes(2);
++
++    // An invalidation, for example by another process, drops definitions.
++    $manager->reset();
++    $manager->getHandler('apple', 'storage');
++    $this->discovery->getDefinitions()->shouldHaveBeenCalledTimes(3);
++  }
++
+   /**
+    * Tests the getHandler() method when no controller is defined.
+    */

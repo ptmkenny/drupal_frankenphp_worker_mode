@@ -1,0 +1,247 @@
+diff --git a/core/includes/bootstrap.inc b/core/includes/bootstrap.inc
+index 714e173a86c..58ef5146037 100644
+--- a/core/includes/bootstrap.inc
++++ b/core/includes/bootstrap.inc
+@@ -525,2 +525,3 @@ function &drupal_register_shutdown_function($callback = NULL, ...$args) {
+   static $callbacks = [];
++  static $registered = FALSE;
+ 
+@@ -528,4 +529,5 @@ function &drupal_register_shutdown_function($callback = NULL, ...$args) {
+     // Only register the internal shutdown function once.
+-    if (empty($callbacks)) {
++    if (!$registered) {
+       register_shutdown_function('_drupal_shutdown_function');
++      $registered = TRUE;
+     }
+@@ -537,2 +539,38 @@ function &drupal_register_shutdown_function($callback = NULL, ...$args) {
+ 
++/**
++ * Consumes shutdown callbacks at the end of a persistent worker request.
++ *
++ * Unlike process shutdown, this releases callbacks and permits registration
++ * for the next request. The outgoing request and container must remain usable.
++ *
++ * @internal
++ *   Called by the kernel after worker request termination.
++ */
++function _drupal_shutdown_request(): void {
++  static $running = FALSE;
++  if ($running) {
++    return;
++  }
++  $running = TRUE;
++  $callbacks = &drupal_register_shutdown_function();
++  try {
++    // Callbacks may append more callbacks. Remove each before invoking it so
++    // neither recursive cleanup nor process shutdown can invoke it twice.
++    while ($callback = array_shift($callbacks)) {
++      try {
++        call_user_func_array($callback['callback'], $callback['arguments']);
++      }
++      catch (\Throwable $error) {
++        _drupal_shutdown_function_handle_exception($error);
++      }
++      finally {
++        unset($callback);
++      }
++    }
++  }
++  finally {
++    $running = FALSE;
++  }
++}
++
+ /**
+diff --git a/core/lib/Drupal/Core/Database/Database.php b/core/lib/Drupal/Core/Database/Database.php
+index 990efb9bb0a..3dab1899702 100644
+--- a/core/lib/Drupal/Core/Database/Database.php
++++ b/core/lib/Drupal/Core/Database/Database.php
+@@ -747,2 +747,4 @@ public static function commitAllOnShutdown(bool $shutdown = FALSE): void {
+     if ($shutdown) {
++      // New transactions must register cleanup again in a persistent worker.
++      $registered = FALSE;
+       foreach (self::$connections as $targets) {
+diff --git a/core/lib/Drupal/Core/DrupalKernel.php b/core/lib/Drupal/Core/DrupalKernel.php
+--- a/core/lib/Drupal/Core/DrupalKernel.php
++++ b/core/lib/Drupal/Core/DrupalKernel.php
+@@ -736,2 +736,3 @@
+     if ($this->booted && $this->getHttpKernel() instanceof TerminableInterface) {
++      parse_str($_SERVER['APP_RUNTIME_MODE'] ?? '', $runtime_mode);
+       try {
+@@ -753,7 +754,13 @@
+       finally {
+-        // Release the request even if termination fails. Subsequent requests
+-        // may bypass preHandle(), for example when served from the page cache.
+-        if ($this->prepared === TRUE) {
+-          $this->prepared = FALSE;
+-          $this->container->get('request_stack')->pop();
++        try {
++          if (!empty($runtime_mode['worker'])) {
++            _drupal_shutdown_request();
++          }
++        }
++        finally {
++          // Release the request even if termination or cleanup fails.
++          if ($this->prepared === TRUE) {
++            $this->prepared = FALSE;
++            $this->container->get('request_stack')->pop();
++          }
+         }
+diff --git a/core/tests/Drupal/KernelTests/Core/Bootstrap/ShutdownFunctionTest.php b/core/tests/Drupal/KernelTests/Core/Bootstrap/ShutdownFunctionTest.php
+index a8e7e8285c1..b6c3b9c0fa0 100644
+--- a/core/tests/Drupal/KernelTests/Core/Bootstrap/ShutdownFunctionTest.php
++++ b/core/tests/Drupal/KernelTests/Core/Bootstrap/ShutdownFunctionTest.php
+@@ -6,2 +6,4 @@
+ 
++use Drupal\Core\Batch\BatchStorageInterface;
++use Drupal\Core\Lock\DatabaseLockBackend;
+ use Drupal\KernelTests\KernelTestBase;
+@@ -52,2 +54,96 @@ public function testShutdownFunctionInShutdownFunction(): void {
+ 
++  /**
++   * Tests request cleanup consumes nested callbacks without replaying them.
++   */
++  public function testRequestShutdown(): void {
++    $events = [];
++    $owner = new \stdClass();
++    $reference = \WeakReference::create($owner);
++    drupal_register_shutdown_function(static function () use (&$events, $owner): void {
++      $owner->called = TRUE;
++      $events[] = 'first';
++      drupal_register_shutdown_function(static function () use (&$events): void {
++        $events[] = 'nested';
++      });
++      _drupal_shutdown_request();
++    });
++    drupal_register_shutdown_function(static function () use (&$events): void {
++      $events[] = 'second';
++    });
++    unset($owner);
++    _drupal_shutdown_request();
++    $this->assertSame(['first', 'second', 'nested'], $events);
++    $this->assertNull($reference->get());
++    $this->assertEmpty(drupal_register_shutdown_function());
++    _drupal_shutdown_request();
++    _drupal_shutdown_function();
++    $this->assertCount(3, $events);
++    drupal_register_shutdown_function(static function () use (&$events): void {
++      $events[] = 'next request';
++    });
++    _drupal_shutdown_request();
++    $this->assertSame('next request', end($events));
++    $this->assertEmpty(drupal_register_shutdown_function());
++  }
++
++  /**
++   * Tests a failed callback does not prevent remaining request cleanup.
++   */
++  public function testFailedRequestCallback(): void {
++    $this->container->get('config.storage')->write('system.logging', ['error_level' => 'hide']);
++    $log = ini_set('error_log', '/dev/null');
++    try {
++      drupal_register_shutdown_function(static function (): void {
++        throw new \RuntimeException('Expected shutdown failure.');
++      });
++      drupal_register_shutdown_function([$this, 'shutdownTwo']);
++      _drupal_shutdown_request();
++      $this->assertTrue($this->shutDownTwoCalled);
++      $this->assertEmpty(drupal_register_shutdown_function());
++    }
++    finally {
++      ini_set('error_log', $log);
++    }
++  }
++
++  /**
++   * Tests request cleanup persists batch progress and releases database locks.
++   */
++  public function testBatchAndLockCleanup(): void {
++    require_once $this->root . '/core/includes/form.inc';
++    require_once $this->root . '/core/includes/batch.inc';
++    $batch = &batch_get();
++    $batch = ['id' => 123, 'sets' => []];
++    _batch_needs_update(TRUE);
++    $storage = $this->createMock(BatchStorageInterface::class);
++    $storage->expects($this->once())->method('update')->with($batch);
++    $this->container->set('batch.storage', $storage);
++    drupal_register_shutdown_function('_batch_shutdown');
++    $lock = new DatabaseLockBackend($this->container->get('database'));
++    $this->assertTrue($lock->acquire('request_shutdown'));
++    $this->assertFalse($lock->lockMayBeAvailable('request_shutdown'));
++    _drupal_shutdown_request();
++    $this->assertTrue($lock->lockMayBeAvailable('request_shutdown'));
++    $this->assertEmpty(drupal_register_shutdown_function());
++    _drupal_shutdown_request();
++    $batch = [];
++    _batch_needs_update(FALSE);
++  }
++
++  /**
++   * Tests database commit callbacks register again after request shutdown.
++   */
++  #[\PHPUnit\Framework\Attributes\IgnoreDeprecations]
++  public function testTransactionCleanupAcrossRequests(): void {
++    for ($i = 0; $i < 2; $i++) {
++      $transaction = $this->container->get('database')->startTransaction();
++      $callbacks = drupal_register_shutdown_function();
++      $this->assertContains('\\Drupal\\Core\\Database\\Database::commitAllOnShutdown', array_column($callbacks, 'callback'));
++      _drupal_shutdown_request();
++      $this->assertEmpty(drupal_register_shutdown_function());
++      $this->assertFalse($this->container->get('database')->inTransaction());
++      unset($transaction);
++    }
++  }
++
+   /**
+diff --git a/core/tests/Drupal/Tests/Core/DrupalKernel/DrupalKernelTest.php b/core/tests/Drupal/Tests/Core/DrupalKernel/DrupalKernelTest.php
+index 86e08c95342..381a67699b9 100644
+--- a/core/tests/Drupal/Tests/Core/DrupalKernel/DrupalKernelTest.php
++++ b/core/tests/Drupal/Tests/Core/DrupalKernel/DrupalKernelTest.php
+@@ -6,2 +6,5 @@
+ 
++use Symfony\Component\DependencyInjection\ContainerBuilder as SymfonyContainerBuilder;
++use Symfony\Component\HttpKernel\HttpKernel;
++use Symfony\Component\HttpFoundation\RequestStack;
+ use Composer\Autoload\ClassLoader;
+@@ -144,2 +147,41 @@ public function testFindSitePath(): void {
+ 
++  /**
++   * Tests shutdown retains context and runs even when termination throws.
++   */
++  #[RunInSeparateProcess]
++  public function testWorkerTerminationException(): void {
++    require_once DRUPAL_ROOT . '/core/includes/bootstrap.inc';
++    $_SERVER['APP_RUNTIME_MODE'] = 'web=1&worker=1';
++    $request = new Request();
++    $stack = new RequestStack();
++    $stack->push($request);
++    $http_kernel = $this->createMock(HttpKernel::class);
++    $exception = new \RuntimeException('Termination failed.');
++    $http_kernel->expects($this->once())->method('terminate')->willThrowException($exception);
++    $container = new SymfonyContainerBuilder();
++    $container->set('http_kernel', $http_kernel);
++    $container->set('request_stack', $stack);
++    $container->setParameter('kernel.destructable_services', []);
++    $kernel = new DrupalKernel('test', new ClassLoader());
++    foreach (['container' => $container, 'booted' => TRUE, 'prepared' => TRUE] as $property => $value) {
++      (new \ReflectionProperty($kernel, $property))->setValue($kernel, $value);
++    }
++    $called = FALSE;
++    drupal_register_shutdown_function(function () use (&$called, $stack, $request): void {
++      $this->assertSame($request, $stack->getCurrentRequest());
++      $called = TRUE;
++    });
++    try {
++      $kernel->terminate($request, new Response());
++      $this->fail('The termination exception must propagate.');
++    }
++    catch (\RuntimeException $actual) {
++      $this->assertSame($exception, $actual);
++    }
++    $this->assertTrue($called);
++    $this->assertNull($stack->getCurrentRequest());
++    $this->assertEmpty(drupal_register_shutdown_function());
++    unset($_SERVER['APP_RUNTIME_MODE']);
++  }
++
+   /**

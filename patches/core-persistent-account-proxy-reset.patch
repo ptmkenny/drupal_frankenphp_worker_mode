@@ -1,0 +1,77 @@
+diff --git a/core/lib/Drupal/Core/Session/AccountProxy.php b/core/lib/Drupal/Core/Session/AccountProxy.php
+index 8028df16a68..84215e07539 100644
+--- a/core/lib/Drupal/Core/Session/AccountProxy.php
++++ b/core/lib/Drupal/Core/Session/AccountProxy.php
+@@ -4,6 +4,7 @@
+ 
+ use Drupal\Core\DependencyInjection\DependencySerializationTrait;
+ use Symfony\Contracts\EventDispatcher\EventDispatcherInterface;
++use Symfony\Contracts\Service\ResetInterface;
+ 
+ /**
+  * A proxied implementation of AccountInterface.
+@@ -16,7 +17,7 @@
+  * allows legacy code to change the current user where the user cannot be
+  * directly injected into dependent code.
+  */
+-class AccountProxy implements AccountProxyInterface {
++class AccountProxy implements AccountProxyInterface, ResetInterface {
+ 
+   use DependencySerializationTrait;
+ 
+@@ -65,6 +66,18 @@ public function setAccount(AccountInterface $account) {
+     $this->eventDispatcher->dispatch(new AccountSetEvent($account), AccountEvents::SET_USER);
+   }
+ 
++  /**
++   * Resets the current user to the anonymous user.
++   *
++   * A kernel that handles several requests calls this between them, because
++   * requests without authentication do not set the account. Listeners to
++   * AccountEvents::SET_USER, such as the time zone resolver, also reset their
++   * state for the anonymous user.
++   */
++  public function reset(): void {
++    $this->setAccount(new AnonymousUserSession());
++  }
++
+   /**
+    * {@inheritdoc}
+    */
+diff --git a/core/tests/Drupal/Tests/Core/Session/AccountProxyTest.php b/core/tests/Drupal/Tests/Core/Session/AccountProxyTest.php
+index 28367934a63..0e98f67fdb3 100644
+--- a/core/tests/Drupal/Tests/Core/Session/AccountProxyTest.php
++++ b/core/tests/Drupal/Tests/Core/Session/AccountProxyTest.php
+@@ -4,8 +4,10 @@
+ 
+ namespace Drupal\Tests\Core\Session;
+ 
++use Drupal\Core\Session\AccountEvents;
+ use Drupal\Core\Session\AccountInterface;
+ use Drupal\Core\Session\AccountProxy;
++use Drupal\Core\Session\AccountSetEvent;
+ use Drupal\Core\Session\UserSession;
+ use Drupal\Tests\UnitTestCase;
+ use Drupal\user\RoleInterface;
+@@ -74,4 +76,21 @@ public function testHasRole(): void {
+     $this->assertTrue($account_proxy->hasRole(RoleInterface::AUTHENTICATED_ID));
+   }
+ 
++  /**
++   * Tests that reset() replaces the account with the anonymous user.
++   */
++  public function testReset(): void {
++    $dispatcher = $this->prophesize(EventDispatcherInterface::class);
++    $dispatcher->dispatch(Argument::any(), Argument::any())->willReturn(new Event());
++    $account_proxy = new AccountProxy($dispatcher->reveal());
++    $account_proxy->setAccount(new UserSession(['uid' => 2]));
++    $this->assertSame(2, $account_proxy->id());
++
++    $account_proxy->reset();
++    $this->assertSame(0, $account_proxy->id());
++    $this->assertTrue($account_proxy->isAnonymous());
++    // Listeners such as the time zone resolver are notified of the change.
++    $dispatcher->dispatch(Argument::that(static fn($event) => $event instanceof AccountSetEvent && $event->getAccount()->isAnonymous()), AccountEvents::SET_USER)->shouldHaveBeenCalled();
++  }
++
+ }

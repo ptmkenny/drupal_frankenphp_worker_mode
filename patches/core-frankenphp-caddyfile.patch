@@ -1,0 +1,137 @@
+diff --git a/core/assets/scaffold/files/Caddyfile b/core/assets/scaffold/files/Caddyfile
+new file mode 100644
+--- /dev/null
++++ b/core/assets/scaffold/files/Caddyfile
+@@ -0,0 +1,109 @@
++# Drupal with FrankenPHP in standard (non-worker) mode.
++# Run with: frankenphp run --config Caddyfile
++#
++# SERVER_NAME defaults to :80; set a hostname to enable Caddy's automatic HTTPS.
++# DRUPAL_DOCUMENT_ROOT is the filesystem directory corresponding to URL /.
++# For Composer projects, point it at web/, not the project directory.
++# DRUPAL_BASE_PATH defaults to empty for a root installation. For a subdirectory
++# installation, use a leading slash and no trailing slash, e.g. /apps/drupal,
++# and place or symlink Drupal's web directory at that path under the document
++# root. Requests outside that prefix are not served. Keep URL paths intact so
++# PHP and Drupal can determine the installation's base URL.
++#
++# Only index.php, update.php, core/install.php and core/rebuild.php may execute.
++# Drupal's dedicated test PHP endpoints are intentionally not enabled.
++# Caddy does not read .htaccess files. Keep private storage outside the web root;
++# the private-directory rule below covers only sites/*/private directories.
++{
++	frankenphp
++}
++
++{$SERVER_NAME::80} {
++	root * {$DRUPAL_DOCUMENT_ROOT:/var/www/html}
++	encode zstd br gzip
++
++	route {
++		header X-Content-Type-Options nosniff
++		request_header -Proxy
++
++		# Regex quoting makes the configured prefix literal, not a regex pattern.
++		@barePrefix path_regexp ^\Q{$DRUPAL_BASE_PATH}\E$
++		redir @barePrefix {$DRUPAL_BASE_PATH}/{?query} 308
++		@outside not path_regexp ^\Q{$DRUPAL_BASE_PATH}\E/
++		error @outside 404
++
++		@private path_regexp ^\Q{$DRUPAL_BASE_PATH}\E/(vendor|sites/[^/]+/private)(/|$)
++		error @private 403
++
++		# Exempt only .well-known itself from the hidden-directory restriction.
++		@hidden {
++			path_regexp /\.
++			not path_regexp ^\Q{$DRUPAL_BASE_PATH}\E/\.well-known(/|$)
++		}
++		error @hidden 403
++		@hiddenWellKnown path_regexp ^\Q{$DRUPAL_BASE_PATH}\E/\.well-known/(.*/)?\.
++		error @hiddenWellKnown 403
++
++		# These restrictions also apply inside .well-known, regardless of existence.
++		@protected path_regexp (?i)\.(engine|inc|install|make|module|profile|po|sh|.*sql|theme|twig|tpl(\.php)?|xtmpl|yml)(~|\.sw[op]|\.bak|\.orig|\.save)?$|/(Entries[^/]*|Repository|Root|Tag|Template|Caddyfile|composer\.(json|lock)|web\.config|yarn\.lock|package(-lock)?\.json)$|/#[^/]*#$|\.php(~|\.sw[op]|\.bak|\.orig|\.save)$
++		error @protected 403
++
++		@legacy path_regexp legacy ^\Q{$DRUPAL_BASE_PATH}\E/(install|rebuild)\.php$
++		redir @legacy {$DRUPAL_BASE_PATH}/core/{re.legacy.1}.php{?query} 301
++
++		# Block real PHP files, including PATH_INFO and extension case variants.
++		# Nonexistent PHP-looking aliases may still reach Drupal's front controller.
++		@disallowedPhp {
++			path_regexp (?i)\.php(/|$)
++			not path_regexp ^\Q{$DRUPAL_BASE_PATH}\E/((index|update)\.php(/.*)?|core/(install|rebuild)\.php)$
++			file {
++				try_files {path}
++				split_path .php .phP .pHp .pHP .Php .PhP .PHp .PHP
++			}
++		}
++		error @disallowedPhp 403
++
++		@allowedPhp path_regexp ^\Q{$DRUPAL_BASE_PATH}\E/((index|update)\.php(/.*)?|core/(install|rebuild)\.php)$
++		handle @allowedPhp {
++			route {
++				@installer path_regexp ^\Q{$DRUPAL_BASE_PATH}\E/core/install\.php$
++				rewrite @installer {path}?{query}&rewrite=ok
++				@scriptExists file {
++					try_files {path}
++					split_path .php
++				}
++				php @scriptExists
++				error 404
++			}
++		}
++
++		# A replacement at the same URL can remain cached for a year.
++		# Do not assert immutable: ordinary uploads need not be versioned.
++		@static {
++			file
++			path *.avif *.css *.eot *.gif *.gz *.ico *.jpg *.jpeg *.js *.otf *.pdf *.png *.svg *.ttf *.webp *.woff *.woff2
++		}
++		header @static Cache-Control "public, max-age=31536000"
++		@svgz {
++			file
++			path *.svgz
++		}
++		header @svgz {
++			Content-Type image/svg+xml
++			Content-Encoding gzip
++		}
++		@existingFile {
++			file
++			not path */
++		}
++		file_server @existingFile {
++			precompressed br gzip
++		}
++
++		# Use the configured installation's front controller, never a nested index.
++		rewrite * {$DRUPAL_BASE_PATH}/index.php
++		@frontController file
++		php @frontController
++		error 404
++	}
++}
+diff --git a/core/assets/scaffold/files/htaccess b/core/assets/scaffold/files/htaccess
+--- a/core/assets/scaffold/files/htaccess
++++ b/core/assets/scaffold/files/htaccess
+@@ -3,7 +3,7 @@
+ #
+ 
+ # Protect files and directories from prying eyes.
+-<FilesMatch "\.(engine|inc|install|make|module|profile|po|sh|.*sql|theme|twig|tpl(\.php)?|xtmpl|yml)(~|\.sw[op]|\.bak|\.orig|\.save)?$|^(\.(?!well-known).*|Entries.*|Repository|Root|Tag|Template|composer\.(json|lock)|web\.config|yarn\.lock|package(-lock)?\.json)$|^#.*#$|\.php(~|\.sw[op]|\.bak|\.orig|\.save)$">
++<FilesMatch "\.(engine|inc|install|make|module|profile|po|sh|.*sql|theme|twig|tpl(\.php)?|xtmpl|yml)(~|\.sw[op]|\.bak|\.orig|\.save)?$|^(\.(?!well-known).*|Entries.*|Repository|Root|Tag|Template|Caddyfile|composer\.(json|lock)|web\.config|yarn\.lock|package(-lock)?\.json)$|^#.*#$|\.php(~|\.sw[op]|\.bak|\.orig|\.save)$">
+   <IfModule mod_authz_core.c>
+     Require all denied
+   </IfModule>
+diff --git a/core/composer.json b/core/composer.json
+--- a/core/composer.json
++++ b/core/composer.json
+@@ -143,6 +143,7 @@
+                 "[web-root]/.eslintrc.json": "assets/scaffold/files/eslintrc.json",
+                 "[web-root]/.ht.router.php": "assets/scaffold/files/ht.router.php",
+                 "[web-root]/.htaccess": "assets/scaffold/files/htaccess",
++                "[web-root]/Caddyfile": "assets/scaffold/files/Caddyfile",
+                 "[web-root]/example.gitignore": "assets/scaffold/files/example.gitignore",
+                 "[web-root]/index.php": "assets/scaffold/files/index.php",
+                 "[web-root]/INSTALL.txt": "assets/scaffold/files/drupal.INSTALL.txt",

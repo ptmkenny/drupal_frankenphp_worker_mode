@@ -1,0 +1,12 @@
+services:
+  logger.channel.frankenphp_profiler:
+    parent: logger.channel_base
+    arguments: ['frankenphp_profiler']
+
+  # StackedKernelPass prepends the decorated kernel to these arguments.
+  frankenphp_profiler.http_middleware.xhprof:
+    class: Drupal\frankenphp_profiler\StackMiddleware\XhprofProfilerMiddleware
+    arguments: ['@http_client', '@logger.channel.frankenphp_profiler']
+    tags:
+      # Above ajax_page_state (500) and page_cache (200): wrap the whole stack.
+      - { name: http_middleware, priority: 600 }

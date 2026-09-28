@@ -1,0 +1,183 @@
+{
+  "patches": {
+    "drupal/core": [
+      {
+        "description": "Form errors from a previous request block form submission in persistent workers",
+        "url": "https://git.drupalcode.org/project/drupal/-/merge_requests/17245.diff",
+        "extra": {
+          "issue-tracker-url": "https://www.drupal.org/project/drupal/issues/3625990",
+          "purpose": "frankenphp"
+        }
+      },
+      {
+        "description": "Avoid duplicate namespace paths when a persistent kernel boots again",
+        "url": "https://git.drupalcode.org/project/drupal/-/merge_requests/17246.diff",
+        "extra": {
+          "issue-tracker-url": "https://www.drupal.org/project/drupal/issues/3625995",
+          "purpose": "frankenphp"
+        }
+      },
+      {
+        "description": "Remove the static Settings instance from default admin theme for persistent workers",
+        "url": "https://git.drupalcode.org/project/drupal/-/merge_requests/17257.diff",
+        "extra": {
+          "issue-tracker-url": "https://www.drupal.org/project/drupal/issues/3626158",
+          "purpose": "frankenphp"
+        }
+      },
+      {
+        "description": "Remove static translation caches from Views::getHandlerTypes() for persistent workers",
+        "url": "https://git.drupalcode.org/project/drupal/-/merge_requests/17258.diff",
+        "extra": {
+          "issue-tracker-url": "https://www.drupal.org/project/drupal/issues/3150721",
+          "purpose": "frankenphp"
+        }
+      },
+      {
+        "description": "Reset destroyed session state and verify cookie identity across FrankenPHP worker requests",
+        "url": "https://git.drupalcode.org/project/drupal/-/merge_requests/17274.diff",
+        "extra": {
+          "issue-tracker-url": "https://www.drupal.org/project/drupal/issues/3626371",
+          "purpose": "frankenphp"
+        }
+      },
+      {
+        "description": "Reset kernel preparation and release the request even when termination fails (FrankenPHP workers)",
+        "url": "https://git.drupalcode.org/project/drupal/-/merge_requests/17249.diff",
+        "extra": {
+          "issue-tracker-url": "https://www.drupal.org/project/drupal/issues/3626014",
+          "purpose": "frankenphp"
+        }
+      },
+      {
+        "description": "Restore router context after error-page subrequests (FrankenPHP workers)",
+        "url": "https://git.drupalcode.org/project/drupal/-/merge_requests/17248.diff",
+        "extra": {
+          "issue-tracker-url": "https://www.drupal.org/project/drupal/issues/3626006",
+          "purpose": "frankenphp"
+        }
+      },
+      {
+        "description": "PageCache cannot handle multiple main requests (FrankenPHP workers)",
+        "url": "https://git.drupalcode.org/project/drupal/-/merge_requests/5745/diffs.patch",
+        "extra": {
+          "issue-tracker-url": "https://www.drupal.org/project/drupal/issues/3050383",
+          "purpose": "frankenphp"
+        }
+      },
+      {
+        "description": "Add FrankenPHP Caddyfile scaffold and protect it from Apache access",
+        "url": "patches/core-frankenphp-caddyfile.patch",
+        "extra": {
+          "issue-tracker-url": "https://www.drupal.org/project/drupal/issues/3437187",
+          "purpose": "frankenphp"
+        }
+      },
+      {
+        "description": "Keep all services between FrankenPHP requests and reset listed ones in place; reload the container when another process rebuilds it",
+        "url": "patches/core-persistent-request-reset.patch",
+        "extra": {
+          "purpose": "frankenphp",
+          "source": "dev/drupal branch worker_mode",
+          "local-adaptation": "terminate() and handle() hunks rebased onto the kernel termination MR !17249 and the form-errors MR; worker_mode is based on main without them.",
+          "requires": "patches/core-persistent-entity-type-manager-reset.patch (EntityTypeManager::reset()), patches/core-persistent-account-proxy-reset.patch (AccountProxy::reset(); the only fix for the previous user's account and time zone leaking into anonymous requests), and patches/core-persistent-event-dispatcher-reset.patch (removes runtime listeners). The reset list calls these as optional '?reset' methods, so a missing patch fails silently."
+        }
+      },
+      {
+        "description": "Add AccountProxy::reset() so anonymous FrankenPHP requests do not run as the previous user",
+        "url": "patches/core-persistent-account-proxy-reset.patch",
+        "extra": {
+          "purpose": "frankenphp",
+          "source": "dev/drupal branch persistent_account_proxy_reset"
+        }
+      },
+      {
+        "description": "Redirect only the next response in GotoAction so the listener does not stay on a reused event dispatcher (FrankenPHP workers)",
+        "url": "https://git.drupalcode.org/project/drupal/-/merge_requests/17272.diff",
+        "extra": {
+          "issue-tracker-url": "https://www.drupal.org/project/drupal/issues/3626369",
+          "purpose": "frankenphp",
+          "source": "dev/drupal branch persistent_goto_action_listener"
+        }
+      },
+      {
+        "description": "Remove event listeners added at runtime when the event dispatcher is reset (FrankenPHP workers)",
+        "url": "patches/core-persistent-event-dispatcher-reset.patch",
+        "extra": {
+          "purpose": "frankenphp",
+          "source": "dev/drupal branch persistent_event_dispatcher_reset"
+        }
+      },
+      {
+        "description": "Let EntityTypeManager be reused across FrankenPHP requests: service closures for request-scoped dependencies and a reset() that drops handlers",
+        "url": "patches/core-persistent-entity-type-manager-reset.patch",
+        "extra": {
+          "purpose": "frankenphp"
+        }
+      },
+      {
+        "description": "Reset HTML IDs and AJAX mode before each main request",
+        "url": "https://git.drupalcode.org/project/drupal/-/merge_requests/17275.diff",
+        "extra": {
+          "purpose": "frankenphp",
+          "issue-tracker-url": "https://www.drupal.org/project/drupal/issues/3594651"
+        }
+      },
+      {
+        "description": "Release requests held by renderer contexts in persistent workers",
+        "url": "https://git.drupalcode.org/project/drupal/-/merge_requests/17273.diff",
+        "extra": {
+          "purpose": "frankenphp",
+          "issue-tracker-url": "https://www.drupal.org/project/drupal/issues/3626370"
+        }
+      },
+      {
+        "description": "Release native session handler references between worker requests",
+        "url": "patches/core-persistent-session-handler-lifetime.patch",
+        "extra": {
+          "purpose": "frankenphp"
+        }
+      },
+      {
+        "description": "Consume request shutdown callbacks and rearm transaction cleanup in workers",
+        "url": "patches/core-persistent-request-shutdown.patch",
+        "extra": {
+          "purpose": "frankenphp",
+          "local-adaptation": "Compose termination cleanup with the kernel termination MR !17249 finally block; retain its prepared-state reset."
+        }
+      },
+      {
+        "description": "Release the Drupal MIME guesser from Symfony singleton ownership between worker requests",
+        "url": "https://git.drupalcode.org/project/drupal/-/merge_requests/17277.diff",
+        "extra": {
+          "issue-tracker-url": "https://www.drupal.org/project/drupal/issues/3626372",
+          "purpose": "frankenphp"
+        }
+      },
+      {
+        "description": "isFrontPage() returns a stale result after the current route changes",
+        "url": "https://git.drupalcode.org/project/drupal/-/merge_requests/17266.diff",
+        "extra": {
+          "issue-tracker-url": "https://www.drupal.org/project/drupal/issues/3626322",
+          "purpose": "frankenphp"
+        }
+      },
+      {
+        "description": "Reset theme state between persistent worker requests",
+        "url": "https://git.drupalcode.org/project/drupal/-/merge_requests/17267.diff",
+        "extra": {
+          "issue-tracker-url": "https://www.drupal.org/project/drupal/issues/3626324",
+          "purpose": "frankenphp"
+        }
+      },
+      {
+        "description": "PathValidator does not restore router context when matching throws an unhandled exception",
+        "url": "https://git.drupalcode.org/project/drupal/-/merge_requests/17271.diff",
+        "extra": {
+          "issue-tracker-url": "https://www.drupal.org/project/drupal/issues/3626367",
+          "purpose": "frankenphp"
+        }
+      }
+    ]
+  }
+}

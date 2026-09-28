@@ -1,0 +1,4 @@
+# Runs Drupal in FrankenPHP worker mode. Remove this file to return to classic mode.
+web_environment:
+  - "FRANKENPHP_CONFIG=worker /var/www/html/web/index.php 1"
+  - "FRANKENPHP_LOOP_MAX=500"

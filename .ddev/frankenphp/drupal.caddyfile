@@ -1,0 +1,96 @@
+# Routing derived from experimental Drupal commit c10834b3660feb186d0dee3a730456bf4b809cb1.
+# Keep in sync with patches/core-frankenphp-caddyfile.patch when adopting MR changes.
+# The wrapper supplies root, compression and drupal_https/port/scheme variables.
+# Only local adaptation inside the route: PHP environment for DDEV TLS forwarding.
+route {
+	header X-Content-Type-Options nosniff
+	request_header -Proxy
+
+	# Regex quoting makes the configured prefix literal, not a regex pattern.
+	@barePrefix path_regexp ^\Q{$DRUPAL_BASE_PATH}\E$
+	redir @barePrefix {$DRUPAL_BASE_PATH}/{?query} 308
+	@outside not path_regexp ^\Q{$DRUPAL_BASE_PATH}\E/
+	error @outside 404
+
+	@private path_regexp ^\Q{$DRUPAL_BASE_PATH}\E/(vendor|sites/[^/]+/private)(/|$)
+	error @private 403
+
+	# Exempt only .well-known itself from the hidden-directory restriction.
+	@hidden {
+		path_regexp /\.
+		not path_regexp ^\Q{$DRUPAL_BASE_PATH}\E/\.well-known(/|$)
+	}
+	error @hidden 403
+	@hiddenWellKnown path_regexp ^\Q{$DRUPAL_BASE_PATH}\E/\.well-known/(.*/)?\.
+	error @hiddenWellKnown 403
+
+	# These restrictions also apply inside .well-known, regardless of existence.
+	@protected path_regexp (?i)\.(engine|inc|install|make|module|profile|po|sh|.*sql|theme|twig|tpl(\.php)?|xtmpl|yml)(~|\.sw[op]|\.bak|\.orig|\.save)?$|/(Entries[^/]*|Repository|Root|Tag|Template|Caddyfile|composer\.(json|lock)|web\.config|yarn\.lock|package(-lock)?\.json)$|/#[^/]*#$|\.php(~|\.sw[op]|\.bak|\.orig|\.save)$
+	error @protected 403
+
+	@legacy path_regexp legacy ^\Q{$DRUPAL_BASE_PATH}\E/(install|rebuild)\.php$
+	redir @legacy {$DRUPAL_BASE_PATH}/core/{re.legacy.1}.php{?query} 301
+
+	# Block real PHP files, including PATH_INFO and extension case variants.
+	# Nonexistent PHP-looking aliases may still reach Drupal's front controller.
+	@disallowedPhp {
+		path_regexp (?i)\.php(/|$)
+		not path_regexp ^\Q{$DRUPAL_BASE_PATH}\E/((index|update)\.php(/.*)?|core/(install|rebuild)\.php)$
+		file {
+			try_files {path}
+			split_path .php .phP .pHp .pHP .Php .PhP .PHp .PHP
+		}
+	}
+	error @disallowedPhp 403
+
+	@allowedPhp path_regexp ^\Q{$DRUPAL_BASE_PATH}\E/((index|update)\.php(/.*)?|core/(install|rebuild)\.php)$
+	handle @allowedPhp {
+		route {
+			@installer path_regexp ^\Q{$DRUPAL_BASE_PATH}\E/core/install\.php$
+			rewrite @installer {path}?{query}&rewrite=ok
+			@scriptExists file {
+				try_files {path}
+				split_path .php
+			}
+			php @scriptExists {
+				env HTTPS {http.vars.drupal_https}
+				env SERVER_PORT {http.vars.drupal_port}
+				env REQUEST_SCHEME {http.vars.drupal_scheme}
+			}
+			error 404
+		}
+	}
+
+	# A replacement at the same URL can remain cached for a year.
+	# Do not assert immutable: ordinary uploads need not be versioned.
+	@static {
+		file
+		path *.avif *.css *.eot *.gif *.gz *.ico *.jpg *.jpeg *.js *.otf *.pdf *.png *.svg *.ttf *.webp *.woff *.woff2
+	}
+	header @static Cache-Control "public, max-age=31536000"
+	@svgz {
+		file
+		path *.svgz
+	}
+	header @svgz {
+		Content-Type image/svg+xml
+		Content-Encoding gzip
+	}
+	@existingFile {
+		file
+		not path */
+	}
+	file_server @existingFile {
+		precompressed br gzip
+	}
+
+	# Use the configured installation's front controller, never a nested index.
+	rewrite * {$DRUPAL_BASE_PATH}/index.php
+	@frontController file
+	php @frontController {
+		env HTTPS {http.vars.drupal_https}
+		env SERVER_PORT {http.vars.drupal_port}
+		env REQUEST_SCHEME {http.vars.drupal_scheme}
+	}
+	error 404
+}

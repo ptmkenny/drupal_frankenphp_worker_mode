@@ -1,0 +1,40 @@
+{
+  "patches": {
+    "drupal/easy_breadcrumb": [
+      {
+        "description": "Keep route-derived request context local to each breadcrumb build",
+        "url": "https://git.drupalcode.org/project/easy_breadcrumb/-/merge_requests/237.diff",
+        "extra": {
+          "issue-tracker-url": "https://www.drupal.org/project/easy_breadcrumb/issues/3626366",
+          "purpose": "frankenphp"
+        }
+      }
+    ],
+    "drupal/key": [
+      {
+        "description": "Replace the static key value cache with a request-scoped cache",
+        "url": "patches/key-request-scoped-value-cache.patch",
+        "extra": {
+          "issue-tracker-url": "https://www.drupal.org/project/key/issues/3624641"
+        }
+      }
+    ],
+    "drupal/metatag": [
+      {
+        "description": "Replace the static meta tag and token caches with request-scoped state",
+        "url": "https://git.drupalcode.org/project/metatag/-/merge_requests/272.diff",
+        "extra": {
+          "issue-tracker-url": "https://www.drupal.org/project/metatag/issues/3624671"
+        }
+      },
+      {
+        "description": "metatag_views calls preExecute() without postExecute(), leaking the current view across requests",
+        "url": "https://git.drupalcode.org/project/metatag/-/merge_requests/273.diff",
+        "extra": {
+          "purpose": "frankenphp",
+          "issue-tracker-url": "https://www.drupal.org/project/metatag/issues/3626128"
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,203 @@
+diff --git a/core/core.services.yml b/core/core.services.yml
+index 28afb5a64da..9324a62281e 100644
+--- a/core/core.services.yml
++++ b/core/core.services.yml
+@@ -960,7 +960,7 @@ services:
+     arguments: ['@request_stack']
+   Drupal\Core\Routing\RouteMatchInterface: '@current_route_match'
+   event_dispatcher:
+-    class: Symfony\Component\EventDispatcher\EventDispatcher
++    class: Drupal\Core\EventDispatcher\EventDispatcher
+   Psr\EventDispatcher\EventDispatcherInterface: '@event_dispatcher'
+   Symfony\Contracts\EventDispatcher\EventDispatcherInterface: '@event_dispatcher'
+   Symfony\Component\EventDispatcher\EventDispatcherInterface: '@event_dispatcher'
+diff --git a/core/lib/Drupal/Core/DependencyInjection/Compiler/RegisterEventSubscribersPass.php b/core/lib/Drupal/Core/DependencyInjection/Compiler/RegisterEventSubscribersPass.php
+index 845f0ee6ded..6365f225659 100644
+--- a/core/lib/Drupal/Core/DependencyInjection/Compiler/RegisterEventSubscribersPass.php
++++ b/core/lib/Drupal/Core/DependencyInjection/Compiler/RegisterEventSubscribersPass.php
+@@ -2,6 +2,7 @@
+ 
+ namespace Drupal\Core\DependencyInjection\Compiler;
+ 
++use Drupal\Core\EventDispatcher\EventDispatcher;
+ use Symfony\Component\DependencyInjection\ContainerBuilder;
+ use Symfony\Component\DependencyInjection\Compiler\CompilerPassInterface;
+ use Symfony\Component\EventDispatcher\DependencyInjection\RegisterListenersPass;
+@@ -28,6 +29,15 @@ public function process(ContainerBuilder $container): void {
+     $this->renameTag($container, 'event_subscriber', 'kernel.event_subscriber');
+     $this->pass->process($container);
+     $this->renameTag($container, 'kernel.event_subscriber', 'event_subscriber');
++
++    // Listeners added after the registrations above are removed on reset.
++    if ($container->hasDefinition('event_dispatcher')) {
++      $definition = $container->getDefinition('event_dispatcher');
++      $class = $container->getParameterBag()->resolveValue($definition->getClass());
++      if (is_string($class) && is_a($class, EventDispatcher::class, TRUE)) {
++        $definition->addMethodCall('lockRegistrations');
++      }
++    }
+   }
+ 
+   /**
+diff --git a/core/lib/Drupal/Core/EventDispatcher/EventDispatcher.php b/core/lib/Drupal/Core/EventDispatcher/EventDispatcher.php
+new file mode 100644
+index 00000000000..8e05929c0b9
+--- /dev/null
++++ b/core/lib/Drupal/Core/EventDispatcher/EventDispatcher.php
+@@ -0,0 +1,60 @@
++<?php
++
++declare(strict_types=1);
++
++namespace Drupal\Core\EventDispatcher;
++
++use Symfony\Component\EventDispatcher\EventDispatcher as SymfonyEventDispatcher;
++use Symfony\Contracts\Service\ResetInterface;
++
++/**
++ * Removes listeners added at runtime when it is reset.
++ *
++ * The container registers event subscribers when it creates this service and
++ * then calls ::lockRegistrations(). Listeners added after that, for example
++ * while a request is handled, are removed by ::reset(). A kernel that handles
++ * several requests resets this service between them, so that such listeners
++ * only apply to the request that added them.
++ */
++class EventDispatcher extends SymfonyEventDispatcher implements ResetInterface {
++
++  /**
++   * Whether the container has finished registering listeners.
++   */
++  private bool $locked = FALSE;
++
++  /**
++   * Listeners added after registration was locked, with their event names.
++   *
++   * @var list<array{string, callable|array}>
++   */
++  private array $runtimeListeners = [];
++
++  /**
++   * Marks the end of the listener registrations from the container.
++   */
++  public function lockRegistrations(): void {
++    $this->locked = TRUE;
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function addListener(string $eventName, callable|array $listener, int $priority = 0): void {
++    parent::addListener($eventName, $listener, $priority);
++    if ($this->locked) {
++      $this->runtimeListeners[] = [$eventName, $listener];
++    }
++  }
++
++  /**
++   * Removes the listeners added after registration was locked.
++   */
++  public function reset(): void {
++    foreach ($this->runtimeListeners as [$event_name, $listener]) {
++      $this->removeListener($event_name, $listener);
++    }
++    $this->runtimeListeners = [];
++  }
++
++}
+diff --git a/core/tests/Drupal/Tests/Core/EventDispatcher/EventDispatcherTest.php b/core/tests/Drupal/Tests/Core/EventDispatcher/EventDispatcherTest.php
+new file mode 100644
+index 00000000000..7c4f9b46276
+--- /dev/null
++++ b/core/tests/Drupal/Tests/Core/EventDispatcher/EventDispatcherTest.php
+@@ -0,0 +1,90 @@
++<?php
++
++declare(strict_types=1);
++
++namespace Drupal\Tests\Core\EventDispatcher;
++
++use Drupal\Core\DependencyInjection\Compiler\RegisterEventSubscribersPass;
++use Drupal\Core\DependencyInjection\ContainerBuilder;
++use Drupal\Core\EventDispatcher\EventDispatcher;
++use Drupal\Tests\UnitTestCase;
++use PHPUnit\Framework\Attributes\CoversClass;
++use PHPUnit\Framework\Attributes\Group;
++use Symfony\Component\EventDispatcher\DependencyInjection\RegisterListenersPass;
++use Symfony\Component\EventDispatcher\EventDispatcher as SymfonyEventDispatcher;
++use Symfony\Component\EventDispatcher\EventSubscriberInterface;
++
++/**
++ * Tests the removal of listeners added at runtime.
++ */
++#[CoversClass(EventDispatcher::class)]
++#[CoversClass(RegisterEventSubscribersPass::class)]
++#[Group('EventDispatcher')]
++class EventDispatcherTest extends UnitTestCase {
++
++  /**
++   * Tests that reset() removes only listeners added after locking.
++   */
++  public function testReset(): void {
++    $dispatcher = new EventDispatcher();
++    $registered = static function (): void {};
++    $dispatcher->addListener('test', $registered);
++    $dispatcher->lockRegistrations();
++
++    $dispatcher->addListener('test', static function (): void {});
++    $dispatcher->addSubscriber(new TestRuntimeSubscriber());
++    $this->assertCount(3, $dispatcher->getListeners('test'));
++    $this->assertTrue($dispatcher->hasListeners('other'));
++
++    $dispatcher->reset();
++    $this->assertSame([$registered], $dispatcher->getListeners('test'));
++    $this->assertFalse($dispatcher->hasListeners('other'));
++
++    // A listener removed before the reset does not cause an error.
++    $runtime = static function (): void {};
++    $dispatcher->addListener('test', $runtime);
++    $dispatcher->removeListener('test', $runtime);
++    $dispatcher->reset();
++    $this->assertSame([$registered], $dispatcher->getListeners('test'));
++  }
++
++  /**
++   * Tests that the compiler pass locks registrations after subscribers.
++   */
++  public function testCompilerPass(): void {
++    $container = new ContainerBuilder();
++    $container->register('event_dispatcher', EventDispatcher::class);
++    $container->register('subscriber', TestRuntimeSubscriber::class)
++      ->addTag('event_subscriber');
++    (new RegisterEventSubscribersPass(new RegisterListenersPass()))->process($container);
++    $calls = $container->getDefinition('event_dispatcher')->getMethodCalls();
++    $this->assertSame('addListener', $calls[0][0]);
++    $this->assertSame(['lockRegistrations', []], end($calls));
++
++    // Other dispatcher classes are left unchanged.
++    $container = new ContainerBuilder();
++    $container->register('event_dispatcher', SymfonyEventDispatcher::class);
++    (new RegisterEventSubscribersPass(new RegisterListenersPass()))->process($container);
++    $this->assertSame([], $container->getDefinition('event_dispatcher')->getMethodCalls());
++  }
++
++}
++
++/**
++ * Subscribes to two test events.
++ */
++class TestRuntimeSubscriber implements EventSubscriberInterface {
++
++  /**
++   * {@inheritdoc}
++   */
++  public static function getSubscribedEvents(): array {
++    return ['test' => 'onEvent', 'other' => 'onEvent'];
++  }
++
++  /**
++   * Handles an event.
++   */
++  public function onEvent(): void {}
++
++}

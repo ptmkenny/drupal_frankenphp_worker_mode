@@ -1,0 +1,181 @@
+diff --git a/key.services.yml b/key.services.yml
+--- a/key.services.yml
++++ b/key.services.yml
+@@ -1,4 +1,7 @@
+ services:
++  key.value_cache:
++    class: Drupal\key\KeyValueCache
++    arguments: ['@request_stack']
+   key.repository:
+     class: Drupal\key\KeyRepository
+     arguments: ['@entity_type.manager', '@plugin.manager.key.key_provider', '@plugin.manager.key.key_type', '@plugin.manager.key.key_input']
+diff --git a/src/Entity/Key.php b/src/Entity/Key.php
+--- a/src/Entity/Key.php
++++ b/src/Entity/Key.php
+@@ -9,6 +9,7 @@ use Drupal\Core\Entity\EntityWithPluginCollectionInterface;
+ use Drupal\Core\StringTranslation\TranslatableMarkup;
+ use Drupal\key\Exception\KeyValueNotSetException;
+ use Drupal\key\KeyInterface;
++use Drupal\key\KeyValueCache;
+ use Drupal\key\Plugin\KeyPluginCollection;
+ use Drupal\key\Plugin\KeyProviderSettableValueInterface;
+ 
+@@ -260,17 +261,7 @@ class Key extends ConfigEntityBase implements KeyInterface, EntityWithPluginColl
+    * {@inheritdoc}
+    */
+   public function getKeyValue($reset = FALSE) {
+-    $key_id = $this->id();
+-    $key_values = &drupal_static(__FUNCTION__);
+-
+-    // If the key value has not already been retrieved during this page
+-    // request or if the static variable storage needs to be reset for
+-    // this key, retrieve the value using the key provider.
+-    if (!isset($key_values[$key_id]) || $reset) {
+-      $key_values[$key_id] = $this->getKeyProvider()->getKeyValue($this);
+-    }
+-
+-    return $key_values[$key_id];
++    return $this->getKeyValueCache()->get($this, $reset);
+   }
+ 
+   /**
+@@ -308,7 +299,11 @@ class Key extends ConfigEntityBase implements KeyInterface, EntityWithPluginColl
+   #[ActionMethod(adminLabel: new TranslatableMarkup('Delete key value'), pluralize: FALSE)]
+   public function deleteKeyValue() {
+     if ($this->getKeyProvider() instanceof KeyProviderSettableValueInterface) {
+-      return $this->getKeyProvider()->deleteKeyValue($this);
++      $result = $this->getKeyProvider()->deleteKeyValue($this);
++      if ($result) {
++        $this->getKeyValueCache()->delete($this->id());
++      }
++      return $result;
+     }
+     else {
+       return FALSE;
+@@ -358,21 +353,38 @@ class Key extends ConfigEntityBase implements KeyInterface, EntityWithPluginColl
+     }
+ 
+     parent::postSave($storage, $update);
++    $this->getKeyValueCache()->delete($this->id());
+   }
+ 
+   /**
+    * {@inheritdoc}
+    */
+   public static function postDelete(EntityStorageInterface $storage, array $entities) {
++    /** @var \Drupal\key\KeyValueCache $key_value_cache */
++    $key_value_cache = \Drupal::service('key.value_cache');
++
+     foreach ($entities as $key) {
+       /** @var \Drupal\key\Entity\Key $key */
+       // Give the key provider plugin the opportunity to delete the key value.
+       if ($key->getKeyProvider() instanceof KeyProviderSettableValueInterface) {
+         $key->deleteKeyValue();
+       }
++      $key_value_cache->delete($key->id());
+     }
+ 
+     parent::postDelete($storage, $entities);
+   }
+ 
++  /**
++   * Gets the request-scoped key value cache.
++   *
++   * @return \Drupal\key\KeyValueCache
++   *   The key value cache.
++   */
++  protected function getKeyValueCache(): KeyValueCache {
++    /** @var \Drupal\key\KeyValueCache $key_value_cache */
++    $key_value_cache = \Drupal::service('key.value_cache');
++    return $key_value_cache;
++  }
++
+ }
+diff --git a/src/KeyValueCache.php b/src/KeyValueCache.php
+new file mode 100644
+--- /dev/null
++++ b/src/KeyValueCache.php
+@@ -0,0 +1,83 @@
++<?php
++
++declare(strict_types=1);
++
++namespace Drupal\key;
++
++use Symfony\Component\HttpFoundation\Request;
++use Symfony\Component\HttpFoundation\RequestStack;
++
++/**
++ * Caches key values for the lifetime of an HTTP request.
++ */
++final class KeyValueCache {
++
++  /**
++   * Key values keyed by request and key ID.
++   *
++   * @var \WeakMap<\Symfony\Component\HttpFoundation\Request, array<string, mixed>>
++   */
++  private \WeakMap $keyValues;
++
++  /**
++   * Constructs a KeyValueCache object.
++   */
++  public function __construct(
++    private readonly RequestStack $requestStack,
++  ) {
++    $this->keyValues = new \WeakMap();
++  }
++
++  /**
++   * Gets a key value from the request cache or its provider.
++   *
++   * @param \Drupal\key\KeyInterface $key
++   *   The key entity.
++   * @param bool $reset
++   *   Whether to reload the value from the provider.
++   *
++   * @return mixed
++   *   The key value.
++   */
++  public function get(KeyInterface $key, bool $reset = FALSE): mixed {
++    $request = $this->requestStack->getCurrentRequest();
++    if (!$request instanceof Request) {
++      return $key->getKeyProvider()->getKeyValue($key);
++    }
++
++    $key_values = $this->keyValues[$request] ?? [];
++    $key_id = $key->id();
++
++    // Preserve the existing behavior of retrying providers that return NULL.
++    if (!isset($key_values[$key_id]) || $reset) {
++      $key_values[$key_id] = $key->getKeyProvider()->getKeyValue($key);
++      $this->keyValues[$request] = $key_values;
++    }
++
++    return $key_values[$key_id];
++  }
++
++  /**
++   * Deletes a key value from the current request cache.
++   *
++   * @param string $keyId
++   *   The key entity ID.
++   */
++  public function delete(string $keyId): void {
++    $request = $this->requestStack->getCurrentRequest();
++    if (!$request instanceof Request || !isset($this->keyValues[$request])) {
++      return;
++    }
++
++    $key_values = $this->keyValues[$request];
++    unset($key_values[$keyId]);
++
++    if ($key_values === []) {
++      unset($this->keyValues[$request]);
++    }
++    else {
++      $this->keyValues[$request] = $key_values;
++    }
++  }
++
++}

@@ -1,0 +1,5 @@
+name: 'FrankenPHP Profiler'
+type: module
+description: 'Dev-only: per-request XHProf profiling (cookie or header trigger) sent to XHGui, and a Server-Timing header. Install on DDEV only and list it in config_exclude_modules.'
+core_version_requirement: ^11.4 || ^12
+package: 'Development'

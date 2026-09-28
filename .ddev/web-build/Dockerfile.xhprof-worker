@@ -1,0 +1,40 @@
+# Per-request profiling for FrankenPHP worker mode. See modules/frankenphp_profiler/README.md.
+#
+# 1. Replace the packaged xhprof 2.3.10 with a build of master. In 2.3.10 the
+#    observer init returns no handlers when profiling is off, and PHP caches
+#    that per function. A worker calls every Drupal method before profiling
+#    starts, so profiles then contain only closures and internal functions.
+#    Fixed upstream in PR #94 (commit 8f020b9c), not yet released.
+#    Remove this step once a release after 2.3.10 is packaged.
+# 2. Remove DDEV's auto_prepend_file. It runs once per worker and would
+#    profile hundreds of requests as one run. The frankenphp_profiler
+#    middleware starts profiling per request instead.
+ARG XHPROF_REF=157fb0928e6189233291e3deb1fa4c36711912ab
+RUN <<EOF
+set -eu -o pipefail
+
+module=$(find /usr/lib/php-zts/modules -name 'xhprof*.so' | head -n 1)
+if [ -z "$module" ]; then
+    echo "ERROR: packaged xhprof module not found in /usr/lib/php-zts/modules" >&2
+    exit 1
+fi
+
+# Headers must match the installed runtime exactly. Unrelated third-party
+# apt sources can be unreachable, so tolerate update failures like DDEV does;
+# the install below still fails if php-zts-devel cannot be found.
+(timeout 180 apt-get update || true)
+apt-get install -y --no-install-recommends autoconf "php-zts-devel=$(dpkg-query -W -f='${Version}' php-zts-cli)"
+
+src=$(mktemp -d)
+curl -fsSL "https://github.com/longxinH/xhprof/archive/${XHPROF_REF}.tar.gz" | tar xz -C "$src" --strip-components=1
+cd "$src/extension"
+phpize-zts
+./configure --with-php-config=php-config-zts
+make -j"$(nproc)"
+cp modules/xhprof.so "$module"
+cd /
+rm -rf "$src"
+apt-get remove -y autoconf php-zts-devel
+
+sed -i '/^auto_prepend_file=/d' /etc/php-zts/conf.d/*xhprof.ini*
+EOF

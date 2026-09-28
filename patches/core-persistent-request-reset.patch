@@ -1,0 +1,1109 @@
+diff --git a/core/lib/Drupal/Core/DrupalKernel.php b/core/lib/Drupal/Core/DrupalKernel.php
+index 3408104..58bd542 100644
+--- a/core/lib/Drupal/Core/DrupalKernel.php
++++ b/core/lib/Drupal/Core/DrupalKernel.php
+@@ -15,6 +15,7 @@ use Drupal\Core\Config\NullStorage;
+ use Drupal\Core\DependencyInjection\ContainerBuilder;
+ use Drupal\Core\DependencyInjection\ServiceModifierInterface;
+ use Drupal\Core\DependencyInjection\ServiceProviderInterface;
++use Drupal\Core\EventSubscriber\RedirectResponseSubscriber;
+ use Drupal\Core\DependencyInjection\YamlFileLoader;
+ use Drupal\Core\Extension\Extension;
+ use Drupal\Core\Extension\ExtensionDiscovery;
+@@ -24,6 +25,8 @@ use Drupal\Core\Http\TrustedHostsRequestFactory;
+ use Drupal\Core\Installer\InstallerKernel;
+ use Drupal\Core\Installer\InstallerRedirectTrait;
+ use Drupal\Core\Language\Language;
++use Drupal\Core\Language\LanguageManagerInterface;
++use Drupal\Core\Routing\RedirectDestinationInterface;
+ use Drupal\Core\Security\RequestSanitizer;
+ use Drupal\Core\Site\Settings;
+ use Drupal\Core\Test\TestDatabase;
+@@ -38,6 +41,7 @@ use Symfony\Component\HttpFoundation\Session\Storage\MockArraySessionStorage;
+ use Symfony\Component\HttpKernel\Exception\BadRequestHttpException;
+ use Symfony\Component\HttpKernel\Exception\HttpExceptionInterface;
+ use Symfony\Component\HttpKernel\TerminableInterface;
++use Symfony\Component\Routing\RequestContextAwareInterface;
+ 
+ /**
+  * The DrupalKernel class is the core of Drupal itself.
+@@ -149,6 +153,24 @@ class DrupalKernel implements DrupalKernelInterface, TerminableInterface {
+    */
+   protected $prepared = FALSE;
+ 
++  /**
++   * Whether the previous HTTP request has reached termination.
++   */
++  private bool $requestTerminated = FALSE;
++
++  /**
++   * The backwards compatibility class loader registered by this kernel.
++   */
++  private ?BackwardsCompatibilityClassLoader $backwardsCompatibilityClassLoader = NULL;
++
++  /**
++   * The token of the cached container definition this kernel loaded.
++   *
++   * NULL when the container is not tracked, for example because it was not
++   * cached. The next main request then reboots the kernel.
++   */
++  private ?string $containerToken = NULL;
++
+   /**
+    * Holds the list of enabled modules.
+    *
+@@ -534,9 +556,13 @@ class DrupalKernel implements DrupalKernelInterface, TerminableInterface {
+       $this->classLoader->setApcuPrefix($prefix);
+     }
+ 
++    if ($this->backwardsCompatibilityClassLoader !== NULL) {
++      spl_autoload_unregister([$this->backwardsCompatibilityClassLoader, 'loadClass']);
++      $this->backwardsCompatibilityClassLoader = NULL;
++    }
+     if ($this->container->hasParameter('moved_classes')) {
+-      $bc_class_loader = new BackwardsCompatibilityClassLoader($this->container->getParameter('moved_classes'));
+-      spl_autoload_register([$bc_class_loader, 'loadClass']);
++      $this->backwardsCompatibilityClassLoader = new BackwardsCompatibilityClassLoader($this->container->getParameter('moved_classes'));
++      spl_autoload_register([$this->backwardsCompatibilityClassLoader, 'loadClass']);
+     }
+ 
+     $this->booted = TRUE;
+@@ -715,6 +741,9 @@ class DrupalKernel implements DrupalKernelInterface, TerminableInterface {
+    * {@inheritdoc}
+    */
+   public function terminate(Request $request, Response $response): void {
++    // Keep the container available throughout termination, including when a
++    // termination callback throws. Reset it before the next main request.
++    $this->requestTerminated = $this->booted;
+     if ($this->booted && $this->getHttpKernel() instanceof TerminableInterface) {
+       try {
+         // Only run terminate() when essential services have been set up
+@@ -757,6 +786,29 @@ class DrupalKernel implements DrupalKernelInterface, TerminableInterface {
+     }
+ 
+     try {
++      $reboot = $type === self::MAIN_REQUEST && $this->requestTerminated;
++      if ($reboot && $this->isContainerCurrent()) {
++        try {
++          $this->resetForNextRequest();
++          $reboot = FALSE;
++        }
++        catch (\Throwable $e) {
++          trigger_error(sprintf('Resetting services for the next request failed, rebooting the kernel: %s', $e->getMessage()), E_USER_WARNING);
++        }
++      }
++      if ($reboot) {
++        $this->shutdown();
++        $this->bootstrapContainer = NULL;
++        $this->serviceYamls = $this->serviceProviderClasses = $this->serviceProviders = [];
++        $this->prepared = FALSE;
++        $this->requestTerminated = FALSE;
++        // No services, including those normally persisted during an in-request
++        // container rebuild, may carry request data into the next request.
++        \Drupal::unsetContainer();
++        // Retain compatibility with legacy callers until this API is removed.
++        // @phpstan-ignore function.deprecated
++        drupal_static_reset();
++      }
+       if (!$this->booted) {
+         $this->initializeSettings($request);
+         $this->boot();
+@@ -1002,6 +1054,7 @@ class DrupalKernel implements DrupalKernelInterface, TerminableInterface {
+    */
+   protected function initializeContainer() {
+     $this->containerNeedsDumping = FALSE;
++    $this->containerToken = NULL;
+     $session_started = FALSE;
+     $all_messages = [];
+     $config_is_syncing = FALSE;
+@@ -1043,6 +1096,9 @@ class DrupalKernel implements DrupalKernelInterface, TerminableInterface {
+     // not forcing a rebuild, then try and load the container from the cache.
+     if (empty($this->moduleList) && !$this->containerNeedsRebuild) {
+       $container_definition = $this->getCachedContainerDefinition();
++      if (isset($container_definition)) {
++        $this->containerToken = $this->getContainerToken() ?? $this->setContainerToken();
++      }
+     }
+ 
+     // If there is no cached container definition, build a new container from
+@@ -1649,6 +1705,7 @@ class DrupalKernel implements DrupalKernelInterface, TerminableInterface {
+     $saved = TRUE;
+     try {
+       $this->bootstrapContainer->get('cache.container')->set($this->getContainerCacheKey(), $container_definition);
++      $this->containerToken = $this->setContainerToken();
+     }
+     catch (\Exception) {
+       // There is no way to get from the Cache API if the cache set was
+@@ -1660,6 +1717,206 @@ class DrupalKernel implements DrupalKernelInterface, TerminableInterface {
+     return $saved;
+   }
+ 
++  /**
++   * Gets the services that persistent workers reset between main requests.
++   *
++   * Persistent workers keep every service instance for the next main request.
++   * Services that hold data from the previous request, or data that another
++   * process can change, are reset in place instead of being rebuilt, so every
++   * service that holds a reference to them keeps a valid instance.
++   *
++   * Reset methods are called in order, before each main request after the
++   * first, and only for services that were instantiated. A method name that
++   * starts with '?' is only called if the service has that method, for
++   * services whose class depends on the site, such as cache bins.
++   *
++   * @return array<string, string|\Closure>
++   *   Reset method names, or closures that receive the service, keyed by
++   *   service ID.
++   */
++  protected function getRequestResetServices(): array {
++    return [
++      // Hook implementation lists hold hook service instances.
++      'module_handler' => 'resetImplementations',
++      // Drops handlers, which hold loaded entities and per-account access
++      // results, and definitions when their cache tags were invalidated.
++      'entity_type.manager' => '?reset',
++      // Chained fast backends keep the consistent backend's last write time;
++      // memory backends keep their items.
++      'cache.bootstrap' => '?reset',
++      'cache.config' => '?reset',
++      'cache.discovery' => '?reset',
++      'cache.routes' => '?reset',
++      'cache.static' => '?reset',
++      'cache.memory' => '?reset',
++      'cache.access_policy_memory' => '?reset',
++      'entity.memory_cache' => '?reset',
++      // Cache tag checksums; another process can invalidate the tags.
++      'cache_tags.invalidator.checksum' => '?reset',
++      // Configuration and state saved by another process.
++      'config.storage' => 'resetListCache',
++      'config.factory' => 'reset',
++      'state' => 'resetCache',
++      'locale.config_manager' => '?reset',
++      'menu_link.static.overrides' => 'reload',
++      // Menu link definitions kept by the private menu tree storage.
++      'plugin.manager.menu.link' => 'resetDefinitions',
++      // Request state.
++      'current_user' => '?reset',
++      'current_route_match' => 'resetRouteMatch',
++      'theme.manager' => 'resetActiveTheme',
++      'redirect.destination' => static function (RedirectDestinationInterface $redirect_destination): void {
++        $redirect_destination->set(NULL);
++      },
++      'redirect_response_subscriber' => static function (RedirectResponseSubscriber $subscriber): void {
++        $subscriber->setIgnoreDestination(FALSE);
++      },
++      // Negotiated languages per negotiation method.
++      'language_negotiator' => '?reset',
++      // Resetting all language types at once also deletes a shared cache item.
++      'language_manager' => static function (LanguageManagerInterface $language_manager): void {
++        foreach ($language_manager->getLanguageTypes() as $type) {
++          $language_manager->reset($type);
++        }
++      },
++      // Listeners added during a request.
++      'event_dispatcher' => '?reset',
++      // @todo The services below have no reset method. Add one to each and
++      //   use it here instead of setting their properties.
++      // Placeholder results from earlier requests bypass cache invalidation
++      // and cache contexts.
++      'render_cache' => static::resetProperties(['placeholderResultsCache' => []]),
++      // Built tabs include access results for the current user and route.
++      'plugin.manager.menu.local_task' => static::resetProperties(['taskData' => NULL, 'instances' => []]),
++      // Runtime contexts such as the current user and the route's entity.
++      'context.repository' => static::resetProperties(['contexts' => []]),
++      'pager.manager' => static::resetProperties(['pagers' => NULL, 'maxPagerElementId' => -1]),
++      'page_cache_kill_switch' => static::resetProperties(['kill' => FALSE]),
++      // AliasManager::cacheClear() also clears the shared prefix list.
++      'path_alias.manager' => static::resetProperties([
++        'lookupMap' => [],
++        'noPath' => [],
++        'noAlias' => [],
++        'requestedPaths' => [],
++      ]),
++      'Drupal\Core\Queue\InstantQueueRunnerInterface' => static::resetProperties(['queues' => []]),
++      'layout_builder.tempstore_repository' => static::resetProperties(['cache' => []]),
++      // RouteProvider::reset() also invalidates the shared routes cache tag.
++      'router.route_provider' => static::resetProperties(['routes' => []]),
++      // PathValidator replaces the router's context and restores it
++      // afterwards, which leaves a GET context on the router when placeholders
++      // that validate paths render in interleaved fibers. Matching also
++      // accumulates the allowed methods of routes that did not match.
++      'router.no_access_checks' => function (RequestContextAwareInterface $router): void {
++        (static::resetProperties(['allow' => [], 'allowSchemes' => []]))($router);
++        $router->setContext($this->container->get('router.request_context'));
++      },
++    ];
++  }
++
++  /**
++   * Returns a reset that sets properties of a service to the given values.
++   *
++   * This is for services without a reset method. Properties that the class of
++   * the service does not declare are skipped, for example when a module
++   * replaces the class.
++   *
++   * @param array<string, mixed> $values
++   *   The property values, keyed by property name.
++   *
++   * @return \Closure
++   *   A closure that receives the service.
++   */
++  protected static function resetProperties(array $values): \Closure {
++    return static function (object $service) use ($values): void {
++      (function () use ($values): void {
++        foreach ($values as $property => $value) {
++          if (property_exists($this, $property)) {
++            $this->$property = $value;
++          }
++        }
++      })->call($service);
++    };
++  }
++
++  /**
++   * Checks whether the loaded container matches the cached definition.
++   *
++   * Another process that rebuilds or invalidates the container replaces or
++   * deletes the token that is stored with the cached definition.
++   *
++   * @return bool
++   *   TRUE if the kernel can keep its container for the next main request.
++   */
++  private function isContainerCurrent(): bool {
++    return $this->booted
++      && $this->containerToken !== NULL
++      && $this->getContainerToken() === $this->containerToken;
++  }
++
++  /**
++   * Gets the token stored with the cached container definition.
++   *
++   * @return string|null
++   *   The token, or NULL if there is none.
++   */
++  private function getContainerToken(): ?string {
++    $cache = $this->bootstrapContainer->get('cache.container')->get($this->getContainerCacheKey() . ':token');
++    return $cache ? $cache->data : NULL;
++  }
++
++  /**
++   * Stores a new token with the cached container definition.
++   *
++   * @return string
++   *   The new token.
++   */
++  private function setContainerToken(): string {
++    $token = bin2hex(random_bytes(16));
++    $this->bootstrapContainer->get('cache.container')->set($this->getContainerCacheKey() . ':token', $token);
++    return $token;
++  }
++
++  /**
++   * Resets services for the next main request.
++   *
++   * @throws \Throwable
++   *   The first exception thrown by a reset method, after all reset methods
++   *   were called.
++   */
++  protected function resetForNextRequest(): void {
++    $exception = NULL;
++    foreach ($this->getRequestResetServices() as $id => $method) {
++      if (!$this->container->initialized($id)) {
++        continue;
++      }
++      $service = $this->container->get($id);
++      try {
++        if ($method instanceof \Closure) {
++          $method($service);
++        }
++        elseif (!str_starts_with($method, '?')) {
++          $service->$method();
++        }
++        elseif (method_exists($service, $method = substr($method, 1))) {
++          $service->$method();
++        }
++      }
++      catch (\Throwable $e) {
++        // A failing reset must not prevent the remaining resets.
++        $exception ??= $e;
++      }
++    }
++    $this->prepared = FALSE;
++    $this->requestTerminated = FALSE;
++    // Retain compatibility with legacy callers until this API is removed.
++    // @phpstan-ignore function.deprecated
++    drupal_static_reset();
++    if ($exception !== NULL) {
++      throw $exception;
++    }
++  }
++
+   /**
+    * Gets a http kernel from the container.
+    *
+diff --git a/core/modules/system/tests/modules/system_test/persistent-worker.php b/core/modules/system/tests/modules/system_test/persistent-worker.php
+new file mode 100644
+index 0000000..fd7b69a
+--- /dev/null
++++ b/core/modules/system/tests/modules/system_test/persistent-worker.php
+@@ -0,0 +1,173 @@
++<?php
++
++/**
++ * @file
++ * Runs an isolated worker or CLI mutation for persistent kernel tests.
++ */
++
++declare(strict_types=1);
++
++// cspell:ignore frankenphp
++
++use Drupal\Core\Cache\Cache;
++use Drupal\Core\DrupalKernel;
++use Drupal\Core\Site\Settings;
++use Drupal\user\Entity\User;
++use Symfony\Component\HttpFoundation\Request;
++
++$root = dirname(__DIR__, 6);
++chdir($root);
++$autoloader = require $root . '/autoload.php';
++$kernel = new class('prod', $autoloader) extends DrupalKernel {
++
++  /**
++   * Number of container compilations in this process.
++   */
++  public int $compilations = 0;
++
++  /**
++   * {@inheritdoc}
++   */
++  protected function compileContainer() {
++    $this->compilations++;
++    return parent::compileContainer();
++  }
++
++};
++
++if (isset($argv[1])) {
++  // Use the same isolated cache namespace as the HTTP client's test agent.
++  drupal_valid_test_ua($argv[5]);
++  Settings::initialize($root, $argv[1], $autoloader);
++  $kernel->setSitePath($argv[1]);
++  $kernel->boot();
++  $kernel->loadLegacyIncludes();
++  $container = $kernel->getContainer();
++  $container->get('request_stack')->push(Request::create('http://localhost/'));
++  switch ($argv[2]) {
++    case 'data':
++      $container->get('config.factory')->getEditable('system.site')->set('name', 'site-' . $argv[3])->save();
++      User::load($argv[4])->setUsername('user-' . $argv[3])->save();
++      Cache::invalidateTags(['worker_probe']);
++      break;
++
++    case 'install':
++      $container->get('module_installer')->install(['breakpoint']);
++      break;
++
++    case 'uninstall':
++      $container->get('module_installer')->uninstall(['breakpoint']);
++      break;
++
++    case 'rebuild':
++      drupal_flush_all_caches();
++      break;
++
++    case 'delete':
++      User::load($argv[4])->delete();
++      break;
++  }
++  exit;
++}
++
++$worker_id = bin2hex(random_bytes(16));
++$request_count = 0;
++$previous_container = $previous_module_handler = $previous_request_stack = NULL;
++$references = [];
++$request = $response = NULL;
++$handler = static function () use ($kernel, $worker_id, &$request_count, &$previous_container, &$previous_module_handler, &$previous_request_stack, &$references, &$request, &$response): void {
++  $_SERVER['APP_RUNTIME_MODE'] = 'web=1&worker=1';
++  $_SERVER['SCRIPT_NAME'] = '/index.php';
++  $_SERVER['PHP_SELF'] = '/index.php';
++  $request = Request::createFromGlobals();
++  $response = $kernel->handle($request);
++  $container = $kernel->getContainer();
++  $response->headers->set('X-Worker-Id', $worker_id);
++  $response->headers->set('X-Worker-Request', (string) ++$request_count);
++  $response->headers->set('X-Container-State', $previous_container?->get() === $container ? 'reused' : 'fresh');
++  $previous_container = WeakReference::create($container);
++  // Services keep their instance; request state is reset in place.
++  $module_handler = $container->get('module_handler');
++  $response->headers->set('X-Module-Handler-State', $previous_module_handler?->get() === $module_handler ? 'reused' : 'fresh');
++  $previous_module_handler = WeakReference::create($module_handler);
++  $request_stack = $container->get('request_stack');
++  $response->headers->set('X-Request-Stack-State', $previous_request_stack?->get() === $request_stack ? 'reused' : 'fresh');
++  $previous_request_stack = WeakReference::create($request_stack);
++  $response->headers->set('X-Main-Request', $request_stack->getMainRequest() === $request ? 'current' : 'stale');
++  $references[$request_count] = [WeakReference::create($request), $previous_container];
++  $response->headers->set('X-Autoloaders', (string) count(spl_autoload_functions()));
++  $response->headers->set('X-Compilations', (string) $kernel->compilations);
++  $response->headers->set('X-Worker-Uid', (string) $container->get('current_user')->id());
++  if ($request->headers->has('X-Cleanup-Probe')) {
++    $lock = $container->get('lock');
++    $response->headers->set('X-Lock-Available', $lock->lockMayBeAvailable('worker_lifetime') ? 'yes' : 'no');
++    $lock->acquire('worker_lifetime');
++  }
++  // Test the legacy reset without emitting its API deprecation on every boot.
++  // cspell:disable-next-line
++  $container->get('cache.memory')->set('persistent_kernel_testdrupal_static_deprecation', TRUE);
++  // @phpstan-ignore function.deprecated
++  $state = &drupal_static('persistent_kernel_test');
++  $response->headers->set('X-Static-State', $state === NULL ? 'clean' : 'stale');
++  $state = TRUE;
++  $response->headers->set('X-Site-Name', $container->get('config.factory')->get('system.site')->get('name'));
++  $account = User::load($request->headers->get('X-Entity-Id'));
++  $response->headers->set('X-Entity-Name', $account?->getAccountName() ?? 'missing');
++  $response->headers->set('X-Breakpoint-Service', $container->has('breakpoint.manager') ? 'yes' : 'no');
++  $cache = $container->get('cache.default');
++  $response->headers->set('X-Probe-Cache', $cache->get('worker_probe') ? 'hit' : 'miss');
++  $cache->set('worker_probe', TRUE, Cache::PERMANENT, ['worker_probe']);
++  $response->send();
++};
++
++do {
++  $running = frankenphp_handle_request($handler);
++  if ($request !== NULL && $response !== NULL) {
++    $path = $request->getRequestUri();
++    $status = $response->getStatusCode();
++    $kernel->terminate($request, $response);
++    $request = $response = NULL;
++    gc_collect_cycles();
++    if ($profile = getenv('PERSISTENT_WORKER_PROFILE')) {
++      $old_requests = $old_containers = 0;
++      $old_request_numbers = $old_container_numbers = [];
++      foreach ($references as $number => [$request_reference, $container_reference]) {
++        if ($number <= $request_count - 2) {
++          $old_requests += $request_reference->get() !== NULL;
++          $old_containers += $container_reference->get() !== NULL;
++          if ($request_reference->get() !== NULL) {
++            $old_request_numbers[] = $number;
++          }
++          if ($container_reference->get() !== NULL) {
++            $old_container_numbers[] = $number;
++          }
++        }
++      }
++      $callback_classes = [];
++      foreach (drupal_register_shutdown_function() as $callback) {
++        $callable = $callback['callback'];
++        $name = is_array($callable) ? (is_object($callable[0]) ? get_class($callable[0]) : $callable[0]) : (is_object($callable) ? get_class($callable) : $callable);
++        $callback_classes[$name] = ($callback_classes[$name] ?? 0) + 1;
++      }
++      file_put_contents($profile, json_encode([
++        'request' => $request_count,
++        'worker' => $worker_id,
++        'path' => $path,
++        'status' => $status,
++        'used' => memory_get_usage(),
++        'allocated' => memory_get_usage(TRUE),
++        'peak' => memory_get_peak_usage(TRUE),
++        'old_requests' => $old_requests,
++        'old_containers' => $old_containers,
++        'old_request_numbers' => $old_request_numbers,
++        'old_container_numbers' => $old_container_numbers,
++        'autoloaders' => count(spl_autoload_functions()),
++        'namespace_paths' => array_sum(array_map('count', $autoloader->getPrefixesPsr4())),
++        'shutdown_callbacks' => $callback_classes,
++        'default_backend' => get_class($kernel->getContainer()->get('cache.default')),
++        'bootstrap_backend' => get_class($kernel->getContainer()->get('cache.bootstrap')),
++      ], JSON_THROW_ON_ERROR) . "\n", FILE_APPEND);
++    }
++  }
++  gc_collect_cycles();
++} while ($running);
+diff --git a/core/modules/system/tests/src/Functional/DrupalKernel/PersistentKernelTest.php b/core/modules/system/tests/src/Functional/DrupalKernel/PersistentKernelTest.php
+new file mode 100644
+index 0000000..d1da446
+--- /dev/null
++++ b/core/modules/system/tests/src/Functional/DrupalKernel/PersistentKernelTest.php
+@@ -0,0 +1,353 @@
++<?php
++
++declare(strict_types=1);
++
++namespace Drupal\Tests\system\Functional\DrupalKernel;
++
++use Behat\Mink\Session;
++use Drupal\Tests\BrowserTestBase;
++use GuzzleHttp\Cookie\CookieJar;
++use PHPUnit\Framework\Attributes\Group;
++use PHPUnit\Framework\Attributes\RunTestsInSeparateProcesses;
++use Psr\Http\Message\ResponseInterface;
++use Symfony\Component\Process\ExecutableFinder;
++use Symfony\Component\Process\Process;
++
++/**
++ * Tests CLI writes between requests handled by one persistent kernel.
++ */
++#[Group('DrupalKernel')]
++#[RunTestsInSeparateProcesses]
++class PersistentKernelTest extends BrowserTestBase {
++
++  // cspell:ignore frankenphp
++
++  /**
++   * {@inheritdoc}
++   */
++  protected static $modules = ['page_cache', 'serialization'];
++
++  /**
++   * {@inheritdoc}
++   */
++  protected $defaultTheme = 'stark';
++
++  /**
++   * The isolated FrankenPHP server.
++   */
++  private ?Process $worker = NULL;
++
++  /**
++   * The temporary server configuration.
++   */
++  private ?string $workerConfig = NULL;
++
++  /**
++   * The identifier generated when the worker boots.
++   */
++  private string $workerId;
++
++  /**
++   * The last observed request counter.
++   */
++  private int $requestCount = 0;
++
++  /**
++   * {@inheritdoc}
++   */
++  protected function setupBaseUrl(): void {
++    if (!(new ExecutableFinder())->find('frankenphp')) {
++      $this->markTestSkipped('FrankenPHP is required for the persistent kernel test.');
++    }
++    $socket = stream_socket_server('tcp://127.0.0.1:0');
++    $this->assertIsResource($socket);
++    $address = stream_socket_get_name($socket, FALSE);
++    fclose($socket);
++    $previous = getenv('SIMPLETEST_BASE_URL');
++    putenv('SIMPLETEST_BASE_URL=http://' . $address);
++    try {
++      parent::setupBaseUrl();
++    }
++    finally {
++      putenv($previous === FALSE ? 'SIMPLETEST_BASE_URL' : 'SIMPLETEST_BASE_URL=' . $previous);
++    }
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  protected function initMink(): Session {
++    // Optional backend settings are confined to this isolated test site.
++    if ($settings = getenv('PERSISTENT_WORKER_SETTINGS')) {
++      $this->assertFileExists($settings);
++      $filename = $this->root . '/' . $this->siteDirectory . '/settings.php';
++      chmod($filename, 0666);
++      file_put_contents($filename, "\nrequire " . var_export($settings, TRUE) . ';', FILE_APPEND);
++    }
++    $script = '/core/modules/system/tests/modules/system_test/persistent-worker.php';
++    $this->workerConfig = tempnam(sys_get_temp_dir(), 'kernel-worker-');
++    file_put_contents($this->workerConfig, <<<CADDY
++    {
++      admin off
++      auto_https off
++      frankenphp {
++        php_ini memory_limit 1024M
++        worker {$this->root}{$script} 1
++      }
++    }
++    {$this->baseUrl} {
++      root * {$this->root}
++      rewrite * {$script}
++      php
++    }
++    CADDY);
++    $this->worker = new Process(['frankenphp', 'run', '--config', $this->workerConfig, '--adapter', 'caddyfile'], $this->root);
++    $this->worker->start();
++    $address = substr($this->baseUrl, strlen('http://'));
++    $ready = FALSE;
++    for ($attempt = 0; $attempt < 100 && $this->worker->isRunning(); $attempt++) {
++      $socket = @stream_socket_client('tcp://' . $address, timeout: 0.1);
++      if (is_resource($socket)) {
++        fclose($socket);
++        $ready = TRUE;
++        break;
++      }
++      usleep(100000);
++    }
++    $this->assertTrue($ready, $this->worker->getErrorOutput());
++    return parent::initMink();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  protected function initFrontPage(): void {
++    // The HTTP clients below perform every request after users are created.
++  }
++
++  /**
++   * Profiles a worker without recycling for 50 warm-up and 500 measured reads.
++   */
++  public function testMemoryLifetime(): void {
++    if (!($profile = getenv('PERSISTENT_WORKER_PROFILE'))) {
++      $this->markTestSkipped('Set PERSISTENT_WORKER_PROFILE to a diagnostic output path.');
++    }
++    $account = $this->drupalCreateUser();
++    $options = [
++      'base_uri' => $this->baseUrl,
++      'http_errors' => FALSE,
++      'allow_redirects' => FALSE,
++      'timeout' => 30,
++      'headers' => ['X-Entity-Id' => $account->id()],
++    ];
++    $factory = $this->container->get('http_client_factory');
++    $anonymous = $factory->fromOptions($options);
++    $authenticated = $factory->fromOptions($options + ['cookies' => new CookieJar()]);
++    $login = $authenticated->request('POST', '/user/login?_format=json', [
++      'json' => ['name' => $account->getAccountName(), 'pass' => $account->passRaw],
++    ]);
++    $this->assertSame(200, $login->getStatusCode(), (string) $login->getBody());
++    $this->assertWorkerResponse($login);
++    $paths = [
++      '/user/login',
++      '/user/login',
++      '/user/' . $account->id() . '/edit',
++      '/user/login?_drupal_ajax=1',
++      '/missing-worker-route',
++    ];
++    for ($i = 0; $i < 550; $i++) {
++      $index = $i % count($paths);
++      $client = $index === 2 ? $authenticated : $anonymous;
++      $response = $client->request('GET', $paths[$index]);
++      $this->assertSame($index === 4 ? 404 : 200, $response->getStatusCode(), (string) $response->getBody());
++      $this->assertWorkerResponse($response);
++    }
++    // Sending the final response precedes termination and its diagnostic write.
++    for ($attempt = 0; $attempt < 100; $attempt++) {
++      $lines = file($profile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
++      if (count($lines) >= $this->requestCount) {
++        break;
++      }
++      usleep(100000);
++    }
++    $this->assertCount($this->requestCount, $lines);
++    $samples = array_map(static fn(string $line): array => json_decode($line, TRUE, flags: JSON_THROW_ON_ERROR), $lines);
++    // A baseline run records leaks without requiring the pending fixes.
++    if (getenv('PERSISTENT_WORKER_ASSERT_LIFETIME')) {
++      foreach (array_slice($samples, 51) as $sample) {
++        $this->assertSame([], $sample['shutdown_callbacks']);
++        $this->assertSame(0, $sample['old_requests']);
++        $this->assertSame(0, $sample['old_containers']);
++        $this->assertSame($samples[50]['autoloaders'], $sample['autoloaders']);
++        $this->assertSame($samples[50]['namespace_paths'], $sample['namespace_paths']);
++      }
++    }
++  }
++
++  /**
++   * Tests session identity and lock cleanup between worker requests.
++   */
++  public function testRequestCleanup(): void {
++    $account = $this->drupalCreateUser();
++    $options = [
++      'base_uri' => $this->baseUrl,
++      'http_errors' => FALSE,
++      'allow_redirects' => FALSE,
++      'timeout' => 30,
++      'headers' => ['X-Entity-Id' => $account->id(), 'X-Cleanup-Probe' => '1'],
++    ];
++    $factory = $this->container->get('http_client_factory');
++    $anonymous = $factory->fromOptions($options);
++    $authenticated = $factory->fromOptions($options + ['cookies' => new CookieJar()]);
++    $response = $authenticated->request('POST', '/user/login?_format=json', [
++      'json' => ['name' => $account->getAccountName(), 'pass' => $account->passRaw],
++    ]);
++    $this->assertSame(200, $response->getStatusCode());
++    $this->assertWorkerResponse($response);
++    $login = json_decode((string) $response->getBody(), TRUE, flags: JSON_THROW_ON_ERROR);
++    for ($i = 0; $i < 3; $i++) {
++      $response = $authenticated->request('GET', '/user/' . $account->id() . '/edit');
++      $this->assertSame(200, $response->getStatusCode());
++      $this->assertWorkerResponse($response);
++      $this->assertSame((string) $account->id(), $response->getHeaderLine('X-Worker-Uid'));
++      $this->assertSame('yes', $response->getHeaderLine('X-Lock-Available'));
++      // Repeated anonymous pages exercise cached requests between sessions.
++      for ($j = 0; $j < 2; $j++) {
++        $response = $anonymous->request('GET', '/user/login');
++        $this->assertSame(200, $response->getStatusCode());
++        $this->assertWorkerResponse($response);
++        $this->assertSame('0', $response->getHeaderLine('X-Worker-Uid'));
++        $this->assertSame('yes', $response->getHeaderLine('X-Lock-Available'));
++      }
++    }
++    $response = $authenticated->request('POST', '/user/logout?_format=json&token=' . $login['logout_token']);
++    $this->assertSame(204, $response->getStatusCode());
++    $this->assertWorkerResponse($response);
++    $response = $authenticated->request('GET', '/user/login');
++    $this->assertSame(200, $response->getStatusCode());
++    $this->assertWorkerResponse($response);
++    $this->assertSame('0', $response->getHeaderLine('X-Worker-Uid'));
++    $this->assertSame('yes', $response->getHeaderLine('X-Lock-Available'));
++  }
++
++  /**
++   * Tests external changes without restarting the worker.
++   */
++  public function testExternalWrites(): void {
++    $account = $this->drupalCreateUser();
++    $client = $this->container->get('http_client_factory')->fromOptions([
++      'base_uri' => $this->baseUrl,
++      'http_errors' => FALSE,
++      'allow_redirects' => FALSE,
++      'timeout' => 30,
++      'headers' => ['X-Entity-Id' => $account->id()],
++    ]);
++    $read = function (string $path = '/user/login', bool $rebooted = FALSE) use ($client): ResponseInterface {
++      $response = $client->request('GET', $path);
++      $this->assertWorkerResponse($response, $rebooted);
++      return $response;
++    };
++    $initial = $read();
++    $this->assertSame($account->getAccountName(), $initial->getHeaderLine('X-Entity-Name'));
++    $this->assertSame('no', $initial->getHeaderLine('X-Breakpoint-Service'));
++    $loaders = $initial->getHeaderLine('X-Autoloaders');
++    $compilations = $initial->getHeaderLine('X-Compilations');
++    $cached = $read();
++    $this->assertSame('HIT', $cached->getHeaderLine('X-Drupal-Cache'));
++    // Cookie state must be reloaded without carrying identity across browsers.
++    $browser = $this->container->get('http_client_factory')->fromOptions([
++      'base_uri' => $this->baseUrl,
++      'cookies' => new CookieJar(),
++      'http_errors' => FALSE,
++      'allow_redirects' => FALSE,
++      'timeout' => 30,
++      'headers' => ['X-Entity-Id' => $account->id()],
++    ]);
++    $login = $browser->request('POST', '/user/login?_format=json', [
++      'json' => ['name' => $account->getAccountName(), 'pass' => $account->passRaw],
++    ]);
++    $this->assertSame(200, $login->getStatusCode(), (string) $login->getBody());
++    $this->assertWorkerResponse($login);
++    $authenticated = $browser->request('GET', '/user');
++    $this->assertWorkerResponse($authenticated);
++    $this->assertSame((string) $account->id(), $authenticated->getHeaderLine('X-Worker-Uid'));
++    $this->assertSame('0', $read()->getHeaderLine('X-Worker-Uid'));
++    for ($i = 1; $i <= 3; $i++) {
++      $this->write('data', (string) $i, $account->id());
++      $response = $read();
++      $this->assertSame('site-' . $i, $response->getHeaderLine('X-Site-Name'));
++      $this->assertSame('user-' . $i, $response->getHeaderLine('X-Entity-Name'));
++      $this->assertSame('miss', $response->getHeaderLine('X-Probe-Cache'));
++      $this->assertSame($loaders, $response->getHeaderLine('X-Autoloaders'));
++      $this->assertSame($compilations, $response->getHeaderLine('X-Compilations'));
++      // A second request must retain shared cache entries, not purge them.
++      $this->assertSame('hit', $read()->getHeaderLine('X-Probe-Cache'));
++    }
++    // Container rebuilds in another process replace the worker's container.
++    $this->write('install');
++    $this->assertSame('yes', $read(rebooted: TRUE)->getHeaderLine('X-Breakpoint-Service'));
++    $this->write('uninstall');
++    $this->assertSame('no', $read(rebooted: TRUE)->getHeaderLine('X-Breakpoint-Service'));
++    $this->write('rebuild');
++    $this->assertSame('site-3', $read(rebooted: TRUE)->getHeaderLine('X-Site-Name'));
++    $this->write('delete', '', $account->id());
++    $this->assertSame('missing', $read()->getHeaderLine('X-Entity-Name'));
++    $this->assertSame(404, $read('/missing-worker-route')->getStatusCode());
++    $this->assertSame(200, $read()->getStatusCode());
++  }
++
++  /**
++   * Mutates the isolated site in a separate CLI process.
++   */
++  private function write(string $operation, string $value = '', string $uid = ''): void {
++    $process = new Process([
++      PHP_BINARY,
++      $this->root . '/core/modules/system/tests/modules/system_test/persistent-worker.php',
++      $this->siteDirectory,
++      $operation,
++      $value,
++      $uid,
++      $this->databasePrefix,
++    ], $this->root);
++    $process->setTimeout(120);
++    $process->mustRun();
++  }
++
++  /**
++   * Checks that the worker persists while request state is reset.
++   *
++   * @param \Psr\Http\Message\ResponseInterface $response
++   *   The worker response.
++   * @param bool $rebooted
++   *   Whether another process rebuilt the container before this request.
++   */
++  private function assertWorkerResponse(ResponseInterface $response, bool $rebooted = FALSE): void {
++    $id = $response->getHeaderLine('X-Worker-Id');
++    $this->assertNotEmpty($id);
++    $this->workerId ??= $id;
++    $this->assertSame($this->workerId, $id);
++    // The first request boots the kernel; later ones keep its container and
++    // service instances.
++    $state = $this->requestCount === 0 || $rebooted ? 'fresh' : 'reused';
++    $count = (int) $response->getHeaderLine('X-Worker-Request');
++    $this->assertGreaterThan($this->requestCount, $count);
++    $this->requestCount = $count;
++    $this->assertSame($state, $response->getHeaderLine('X-Container-State'));
++    $this->assertSame($state, $response->getHeaderLine('X-Module-Handler-State'));
++    $this->assertSame($state, $response->getHeaderLine('X-Request-Stack-State'));
++    $this->assertSame('current', $response->getHeaderLine('X-Main-Request'));
++    $this->assertSame('clean', $response->getHeaderLine('X-Static-State'));
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  protected function tearDown(): void {
++    $this->worker?->stop();
++    if ($this->workerConfig !== NULL) {
++      unlink($this->workerConfig);
++    }
++    parent::tearDown();
++  }
++
++}
+diff --git a/core/tests/Drupal/Tests/Core/DrupalKernel/DrupalKernelRouterResetTest.php b/core/tests/Drupal/Tests/Core/DrupalKernel/DrupalKernelRouterResetTest.php
+new file mode 100644
+index 0000000..df80541
+--- /dev/null
++++ b/core/tests/Drupal/Tests/Core/DrupalKernel/DrupalKernelRouterResetTest.php
+@@ -0,0 +1,66 @@
++<?php
++
++declare(strict_types=1);
++
++namespace Drupal\Tests\Core\DrupalKernel;
++
++use Composer\Autoload\ClassLoader;
++use Drupal\Core\DrupalKernel;
++use Drupal\Tests\UnitTestCase;
++use PHPUnit\Framework\Attributes\CoversClass;
++use PHPUnit\Framework\Attributes\Group;
++use Symfony\Component\DependencyInjection\ContainerInterface;
++use Symfony\Component\Routing\Matcher\UrlMatcher;
++use Symfony\Component\Routing\RequestContext;
++use Symfony\Component\Routing\RouteCollection;
++
++/**
++ * Tests the router reset between requests handled by one kernel.
++ */
++#[CoversClass(DrupalKernel::class)]
++#[Group('DrupalKernel')]
++class DrupalKernelRouterResetTest extends UnitTestCase {
++
++  /**
++   * Tests that the router is reattached to the shared request context.
++   */
++  public function testResetRouterContext(): void {
++    $shared_context = new RequestContext();
++    // A context that PathValidator left behind for a GET request.
++    $router = new UrlMatcher(new RouteCollection(), new RequestContext());
++    (new \ReflectionProperty(UrlMatcher::class, 'allow'))->setValue($router, ['POST']);
++    $services = ['router.request_context' => $shared_context, 'router.no_access_checks' => $router];
++    $container = $this->createStub(ContainerInterface::class);
++    $container->method('initialized')->willReturn(TRUE);
++    $container->method('get')->willReturnCallback(static fn(string $id): object => $services[$id]);
++
++    $kernel = new TestRouterResetKernel('test', new ClassLoader());
++    $kernel->resetRouter($container);
++
++    $this->assertSame($shared_context, $router->getContext());
++    $this->assertSame([], (new \ReflectionProperty(UrlMatcher::class, 'allow'))->getValue($router));
++  }
++
++}
++
++/**
++ * Resets only the router, using the kernel's reset list.
++ */
++class TestRouterResetKernel extends DrupalKernel {
++
++  /**
++   * {@inheritdoc}
++   */
++  protected function getRequestResetServices(): array {
++    return array_intersect_key(parent::getRequestResetServices(), ['router.no_access_checks' => TRUE]);
++  }
++
++  /**
++   * Resets the router in the given container.
++   */
++  public function resetRouter(ContainerInterface $container): void {
++    $this->container = $container;
++    $this->resetForNextRequest();
++  }
++
++}
+diff --git a/core/tests/Drupal/Tests/Core/DrupalKernel/DrupalKernelTest.php b/core/tests/Drupal/Tests/Core/DrupalKernel/DrupalKernelTest.php
+index 040538e..55daf85 100644
+--- a/core/tests/Drupal/Tests/Core/DrupalKernel/DrupalKernelTest.php
++++ b/core/tests/Drupal/Tests/Core/DrupalKernel/DrupalKernelTest.php
+@@ -12,6 +12,7 @@ use PHPUnit\Framework\Attributes\CoversClass;
+ use PHPUnit\Framework\Attributes\DataProvider;
+ use PHPUnit\Framework\Attributes\Group;
+ use PHPUnit\Framework\Attributes\RunInSeparateProcess;
++use Symfony\Component\DependencyInjection\ContainerInterface;
+ use Symfony\Component\HttpFoundation\Request;
+ use Symfony\Component\HttpFoundation\Response;
+ 
+@@ -184,6 +185,143 @@ EOD;
+     $this->assertTrue(TRUE, "\Drupal\Core\DrupalKernel::terminate() called without error on kernel which has not booted");
+   }
+ 
++  /**
++   * Tests resetting services between persistent requests.
++   */
++  public function testResetForNextRequest(): void {
++    $services = [];
++    foreach (['required', 'optional', 'missing', 'closure', 'throws', 'after_throw', 'unused'] as $id) {
++      $services[$id] = new TestResettableService();
++    }
++    $container = $this->createStub(ContainerInterface::class);
++    $container->method('initialized')->willReturnCallback(static fn(string $id): bool => $id !== 'unused');
++    $container->method('get')->willReturnCallback(static fn(string $id): object => $services[$id]);
++    $services['throws']->exception = new \RuntimeException('Reset failed.');
++
++    $kernel = new TestResetKernel('test', new ClassLoader());
++    $kernel->resetContainer = $container;
++    $kernel->services = [
++      'required' => 'reset',
++      'optional' => '?reset',
++      'missing' => '?doesNotExist',
++      'closure' => static fn(TestResettableService $service) => $service->reset('closure'),
++      'throws' => 'reset',
++      'after_throw' => 'reset',
++      'unused' => 'reset',
++    ];
++    try {
++      $kernel->resetServices();
++      $this->fail('The exception of a failing reset was not rethrown.');
++    }
++    catch (\RuntimeException $e) {
++      $this->assertSame('Reset failed.', $e->getMessage());
++    }
++
++    $this->assertSame(['reset'], $services['required']->calls);
++    $this->assertSame(['reset'], $services['optional']->calls);
++    $this->assertSame([], $services['missing']->calls);
++    $this->assertSame(['closure'], $services['closure']->calls);
++    // A failing reset does not prevent later resets.
++    $this->assertSame(['reset'], $services['after_throw']->calls);
++    // Services that were not instantiated are not reset.
++    $this->assertSame([], $services['unused']->calls);
++  }
++
++  /**
++   * Tests resetting protected properties of a service without reset method.
++   */
++  public function testResetProperties(): void {
++    $service = new TestResettableService();
++    $service->reset();
++    $reset = TestResetKernel::resetPropertiesFor(['state' => [], 'undeclared' => TRUE]);
++    $reset($service);
++    $this->assertSame([], $service->getState());
++    $this->assertFalse(property_exists($service, 'undeclared'));
++  }
++
++}
++
++/**
++ * Exposes the reset of services between requests with a configurable list.
++ */
++class TestResetKernel extends DrupalKernel {
++
++  /**
++   * The services to reset.
++   *
++   * @var array<string, string|\Closure>
++   */
++  public array $services = [];
++
++  /**
++   * {@inheritdoc}
++   */
++  protected function getRequestResetServices(): array {
++    return $this->services;
++  }
++
++  /**
++   * The container with the services to reset.
++   */
++  public ContainerInterface $resetContainer;
++
++  /**
++   * Returns a reset that sets properties of a service.
++   */
++  public static function resetPropertiesFor(array $values): \Closure {
++    return static::resetProperties($values);
++  }
++
++  /**
++   * Resets the services for the next request.
++   */
++  public function resetServices(): void {
++    $this->container = $this->resetContainer;
++    $this->resetForNextRequest();
++  }
++
++}
++
++/**
++ * Records calls to its reset method.
++ */
++class TestResettableService {
++
++  /**
++   * The arguments of each reset call.
++   *
++   * @var string[]
++   */
++  public array $calls = [];
++
++  /**
++   * An exception to throw on reset.
++   */
++  public ?\Throwable $exception = NULL;
++
++  /**
++   * Protected state, changed by each reset.
++   */
++  protected array $state = [];
++
++  /**
++   * Gets the protected state.
++   */
++  public function getState(): array {
++    return $this->state;
++  }
++
++  /**
++   * Records a reset.
++   */
++  public function reset(string $source = 'reset'): void {
++    $this->calls[] = $source;
++    $this->state[] = $source;
++    if ($this->exception) {
++      throw $this->exception;
++    }
++  }
++
+ }
+ 
+ /**
