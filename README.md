@@ -24,6 +24,10 @@ Needless to say these are really bad so don't use this in production.
 
 If you find a worker-mode-related problem and open a core issue, add it to the [persistent app server](https://www.drupal.org/node/2218651) meta issue. If you open an issue or PR in this repo, I will add it to patches.json (core) or contrib.patches.json (contrib).
 
+### Performance
+
+I keep changing things so I don't have good performance numbers. That said, when I was using nginx/PHP-FM, my behat suite took 2 hours to run (no concurrency). In FrankenPHP worker mode, the same suite completes in 1 hr 44 min, a roughly 15% improvement. I expect it will be even faster once the code is improved.
+
 ## Installation
 
 [General Installation Instructions](https://www.drupal.org/docs/develop/local-server-setup/experimental-using-drupal-with-frankenphp-in-worker-mode)
