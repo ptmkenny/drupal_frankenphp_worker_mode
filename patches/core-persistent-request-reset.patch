@@ -78,7 +78,7 @@ index 3408104..58bd542 100644
      if ($this->booted && $this->getHttpKernel() instanceof TerminableInterface) {
        try {
          // Only run terminate() when essential services have been set up
-@@ -757,6 +786,29 @@ class DrupalKernel implements DrupalKernelInterface, TerminableInterface {
+@@ -757,6 +786,30 @@ class DrupalKernel implements DrupalKernelInterface, TerminableInterface {
      }
  
      try {
@@ -93,6 +93,10 @@ index 3408104..58bd542 100644
 +        }
 +      }
 +      if ($reboot) {
++        // Retain compatibility with legacy callers until this API is removed.
++        // It uses the memory cache, so reset before the container is unset.
++        // @phpstan-ignore function.deprecated
++        drupal_static_reset();
 +        $this->shutdown();
 +        $this->bootstrapContainer = NULL;
 +        $this->serviceYamls = $this->serviceProviderClasses = $this->serviceProviders = [];
@@ -101,14 +105,11 @@ index 3408104..58bd542 100644
 +        // No services, including those normally persisted during an in-request
 +        // container rebuild, may carry request data into the next request.
 +        \Drupal::unsetContainer();
-+        // Retain compatibility with legacy callers until this API is removed.
-+        // @phpstan-ignore function.deprecated
-+        drupal_static_reset();
 +      }
        if (!$this->booted) {
          $this->initializeSettings($request);
          $this->boot();
-@@ -1002,6 +1054,7 @@ class DrupalKernel implements DrupalKernelInterface, TerminableInterface {
+@@ -1002,6 +1055,7 @@ class DrupalKernel implements DrupalKernelInterface, TerminableInterface {
     */
    protected function initializeContainer() {
      $this->containerNeedsDumping = FALSE;
@@ -116,7 +117,7 @@ index 3408104..58bd542 100644
      $session_started = FALSE;
      $all_messages = [];
      $config_is_syncing = FALSE;
-@@ -1043,6 +1096,9 @@ class DrupalKernel implements DrupalKernelInterface, TerminableInterface {
+@@ -1043,6 +1097,9 @@ class DrupalKernel implements DrupalKernelInterface, TerminableInterface {
      // not forcing a rebuild, then try and load the container from the cache.
      if (empty($this->moduleList) && !$this->containerNeedsRebuild) {
        $container_definition = $this->getCachedContainerDefinition();
@@ -126,7 +127,7 @@ index 3408104..58bd542 100644
      }
  
      // If there is no cached container definition, build a new container from
-@@ -1649,6 +1705,7 @@ class DrupalKernel implements DrupalKernelInterface, TerminableInterface {
+@@ -1649,6 +1706,7 @@ class DrupalKernel implements DrupalKernelInterface, TerminableInterface {
      $saved = TRUE;
      try {
        $this->bootstrapContainer->get('cache.container')->set($this->getContainerCacheKey(), $container_definition);
@@ -134,7 +135,7 @@ index 3408104..58bd542 100644
      }
      catch (\Exception) {
        // There is no way to get from the Cache API if the cache set was
-@@ -1660,6 +1717,206 @@ class DrupalKernel implements DrupalKernelInterface, TerminableInterface {
+@@ -1660,6 +1718,206 @@ class DrupalKernel implements DrupalKernelInterface, TerminableInterface {
      return $saved;
    }
  

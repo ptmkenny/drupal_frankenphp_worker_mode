@@ -5,7 +5,7 @@ This repo contains experimental code for getting Drupal to run on FrankenPHP's w
 ## Warning
 
 - This is experimental. Optimistically, Drupal core needs 20+ commits to officially support FrankenPHP worker mode, and contrib will need even more.
-- I tested on Drupal 12 alpha 1. This code will definitely not work on [anything less than 11.4 because it needs symfony/runtime](https://www.drupal.org/project/drupal/issues/3313404).
+- I tested on Drupal 12 beta 1. This code will definitely not work on [anything less than 11.4 because it needs symfony/runtime](https://www.drupal.org/project/drupal/issues/3313404).
 
 ## AI Disclosure
 
@@ -57,3 +57,10 @@ I will accept MRs for fixes or any additional useful tools that anyone finds or 
 ## License
 
 GPL-2.0-or-later, the same as Drupal core. See [LICENSE.txt](LICENSE.txt).
+
+## Changelog
+
+### 2026-10-01
+
+- `patches/core-persistent-request-reset.patch`: when the worker reboots the kernel (because another process rebuilt the container, or a service reset failed), `drupal_static_reset()` now runs before `\Drupal::unsetContainer()` instead of after it. Since Drupal 12.0.0-beta1 ([#3037054](https://www.drupal.org/project/drupal/issues/3037054)), `drupal_static_reset()` uses `\Drupal::cache('memory')` to trigger its deprecation only once. Calling it after the container is unset threw `ContainerNotInitializedException`, so the first request after a `drush cr` or similar was a fatal error.
+
